@@ -9,7 +9,6 @@ use globset::{Glob, GlobSet, GlobSetBuilder};
 use ignore::WalkBuilder;
 use regex::RegexBuilder;
 use serde::{Deserialize, Serialize};
-use walkdir::WalkDir;
 
 /// Hard wall-clock timeout for `glob_search` (seconds).
 const GLOB_TIMEOUT_SECS: u64 = 5;
@@ -19,6 +18,14 @@ const GLOB_MAX_VISITED: usize = 50_000;
 const GLOB_MAX_DEPTH: usize = 20;
 /// Max results returned (mirrors prior behavior).
 const GLOB_MAX_RESULTS: usize = 100;
+/// Hard wall-clock timeout for `grep_search` (seconds).
+const GREP_TIMEOUT_SECS: u64 = 10;
+/// Max directory entries visited by `grep_search` before bailing out.
+const GREP_MAX_VISITED: usize = 100_000;
+/// Max recursion depth for `grep_search`.
+const GREP_MAX_DEPTH: usize = 20;
+/// Skip any file larger than this (bytes) in `grep_search`. Mirrors `MAX_READ_SIZE`.
+const GREP_MAX_FILE_SIZE: u64 = MAX_READ_SIZE;
 /// Directories always pruned when the base is `$HOME` or `/`.
 const GLOB_SKIP_DIRS: &[&str] = &[
     ".cache",
@@ -461,7 +468,32 @@ pub fn glob_search(pattern: &str, path: Option<&str>) -> io::Result<GlobSearchOu
 }
 
 /// Runs a regex search over workspace files with optional context lines.
+/// Safely read a file to string, refusing non-regular files (FIFO, socket,
+/// block/char device) and files larger than `GREP_MAX_FILE_SIZE`. Prevents
+/// `grep_search` from blocking forever on a named pipe or device.
+fn read_regular_file_capped(path: &Path) -> io::Result<String> {
+    let meta = fs::symlink_metadata(path)?;
+    let ft = meta.file_type();
+    if !ft.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "not a regular file",
+        ));
+    }
+    if meta.len() > GREP_MAX_FILE_SIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "file exceeds size cap",
+        ));
+    }
+    fs::read_to_string(path)
+}
+
+#[allow(clippy::too_many_lines)]
 pub fn grep_search(input: &GrepSearchInput) -> io::Result<GrepSearchOutput> {
+    let started = Instant::now();
+    let deadline = started + std::time::Duration::from_secs(GREP_TIMEOUT_SECS);
+
     let base_path = input
         .path
         .as_deref()
@@ -492,12 +524,18 @@ pub fn grep_search(input: &GrepSearchInput) -> io::Result<GrepSearchOutput> {
     let mut content_lines = Vec::new();
     let mut total_matches = 0usize;
 
-    for file_path in collect_search_files(&base_path)? {
+    for file_path in collect_search_files(&base_path, deadline)? {
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("grep_search: wall-clock timeout ({GREP_TIMEOUT_SECS}s) exceeded"),
+            ));
+        }
         if !matches_optional_filters(&file_path, glob_filter.as_ref(), file_type) {
             continue;
         }
 
-        let Ok(file_contents) = fs::read_to_string(&file_path) else {
+        let Ok(file_contents) = read_regular_file_capped(&file_path) else {
             continue;
         };
 
@@ -570,15 +608,53 @@ pub fn grep_search(input: &GrepSearchInput) -> io::Result<GrepSearchOutput> {
     })
 }
 
-fn collect_search_files(base_path: &Path) -> io::Result<Vec<PathBuf>> {
+fn collect_search_files(base_path: &Path, deadline: Instant) -> io::Result<Vec<PathBuf>> {
     if base_path.is_file() {
         return Ok(vec![base_path.to_path_buf()]);
     }
 
+    let dangerous = is_dangerous_base(base_path);
+    let skip_prefixes: Vec<PathBuf> = if dangerous {
+        GLOB_SKIP_DIRS.iter().map(|d| base_path.join(d)).collect()
+    } else {
+        Vec::new()
+    };
+
+    let mut builder = WalkBuilder::new(base_path);
+    builder
+        .max_depth(Some(GREP_MAX_DEPTH))
+        .follow_links(false)
+        .hidden(false)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .ignore(true)
+        .parents(true);
+    if !skip_prefixes.is_empty() {
+        let prefixes = skip_prefixes.clone();
+        builder.filter_entry(move |entry| {
+            let p = entry.path();
+            !prefixes.iter().any(|skip| p.starts_with(skip))
+        });
+    }
+
     let mut files = Vec::new();
-    for entry in WalkDir::new(base_path) {
-        let entry = entry.map_err(|error| io::Error::other(error.to_string()))?;
-        if entry.file_type().is_file() {
+    let mut visited: usize = 0;
+    for entry_result in builder.build() {
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("grep_search: wall-clock timeout ({GREP_TIMEOUT_SECS}s) exceeded while collecting files"),
+            ));
+        }
+        visited += 1;
+        if visited > GREP_MAX_VISITED {
+            return Err(io::Error::other(format!(
+                "grep_search: visited-entry cap ({GREP_MAX_VISITED}) exceeded"
+            )));
+        }
+        let Ok(entry) = entry_result else { continue };
+        if matches!(entry.file_type(), Some(ft) if ft.is_file()) {
             files.push(entry.path().to_path_buf());
         }
     }
@@ -629,21 +705,50 @@ fn apply_limit<T>(
 }
 
 fn make_patch(original: &str, updated: &str) -> Vec<StructuredPatchHunk> {
-    let mut lines = Vec::new();
-    for line in original.lines() {
-        lines.push(format!("-{line}"));
-    }
-    for line in updated.lines() {
-        lines.push(format!("+{line}"));
+    use similar::{ChangeTag, TextDiff};
+
+    let diff = TextDiff::from_lines(original, updated);
+    let mut hunks = Vec::new();
+
+    for group in diff.grouped_ops(3) {
+        let old_start = group
+            .first()
+            .map_or(1, |op| op.old_range().start.saturating_add(1));
+        let new_start = group
+            .first()
+            .map_or(1, |op| op.new_range().start.saturating_add(1));
+        let old_lines = group
+            .last()
+            .map_or(0, |op| op.old_range().end)
+            .saturating_sub(old_start.saturating_sub(1));
+        let new_lines = group
+            .last()
+            .map_or(0, |op| op.new_range().end)
+            .saturating_sub(new_start.saturating_sub(1));
+
+        let mut lines = Vec::new();
+        for op in &group {
+            for change in diff.iter_changes(op) {
+                let prefix = match change.tag() {
+                    ChangeTag::Delete => "-",
+                    ChangeTag::Insert => "+",
+                    ChangeTag::Equal => " ",
+                };
+                let value = change.value().trim_end_matches('\n');
+                lines.push(format!("{prefix}{value}"));
+            }
+        }
+
+        hunks.push(StructuredPatchHunk {
+            old_start,
+            old_lines,
+            new_start,
+            new_lines,
+            lines,
+        });
     }
 
-    vec![StructuredPatchHunk {
-        old_start: 1,
-        old_lines: original.lines().count(),
-        new_start: 1,
-        new_lines: updated.lines().count(),
-        lines,
-    }]
+    hunks
 }
 
 fn normalize_path(path: &str) -> io::Result<PathBuf> {
@@ -961,11 +1066,13 @@ mod glob_hardening_tests {
         let t0 = Instant::now();
         let res = glob_search("**/mic*.y*ml*", Some(&home));
         let elapsed = t0.elapsed();
+        // Must complete within timeout+small slack, regardless of success/err.
         assert!(
             elapsed.as_secs() < GLOB_TIMEOUT_SECS + 3,
             "reproducer took {elapsed:?}, expected < {}s",
             GLOB_TIMEOUT_SECS + 3
         );
+        // Either found some files or bailed out cleanly.
         match res {
             Ok(o) => assert!(o.num_files <= GLOB_MAX_RESULTS),
             Err(e) => assert!(matches!(
@@ -1033,6 +1140,114 @@ mod glob_hardening_tests {
             "deep file should be excluded by depth cap; got {names:?}"
         );
 
+        let _ = fs::remove_dir_all(&base);
+    }
+}
+
+#[cfg(test)]
+mod grep_hardening_tests {
+    use super::*;
+
+    fn mk_input(path: &Path, pattern: &str) -> GrepSearchInput {
+        GrepSearchInput {
+            pattern: pattern.to_string(),
+            path: Some(path.to_string_lossy().into_owned()),
+            glob: None,
+            output_mode: Some(String::from("files_with_matches")),
+            before: None,
+            after: None,
+            context_short: None,
+            context: None,
+            line_numbers: Some(false),
+            case_insensitive: Some(false),
+            file_type: None,
+            head_limit: None,
+            offset: None,
+            multiline: Some(false),
+        }
+    }
+
+    fn tmp_dir(tag: &str) -> PathBuf {
+        let base = std::env::temp_dir().join(format!(
+            "grep-{tag}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&base).unwrap();
+        base
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn grep_search_skips_fifo_without_hanging() {
+        let base = tmp_dir("fifo");
+        fs::write(base.join("real.txt"), "needle in haystack\n").unwrap();
+
+        let fifo = base.join("pipe");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo binary");
+        assert!(status.success(), "mkfifo failed");
+
+        let t0 = Instant::now();
+        let out = grep_search(&mk_input(&base, "needle")).expect("should not error on fifo");
+        assert!(
+            t0.elapsed().as_secs() < GREP_TIMEOUT_SECS,
+            "grep took {:?} — likely hung on FIFO",
+            t0.elapsed()
+        );
+        assert!(out.filenames.iter().any(|f| f.ends_with("real.txt")));
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn grep_search_skips_oversize_files() {
+        let base = tmp_dir("oversize");
+        fs::write(base.join("small.txt"), "needle here\n").unwrap();
+
+        let big = base.join("big.txt");
+        let f = fs::File::create(&big).unwrap();
+        f.set_len(GREP_MAX_FILE_SIZE + 1024).unwrap();
+        drop(f);
+
+        let out = grep_search(&mk_input(&base, "needle")).expect("should succeed");
+        assert!(out.filenames.iter().any(|f| f.ends_with("small.txt")));
+        assert!(
+            !out.filenames.iter().any(|f| f.ends_with("big.txt")),
+            "oversize file must be skipped; got {:?}",
+            out.filenames
+        );
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn grep_search_depth_cap_excludes_deep_files() {
+        let base = tmp_dir("depth");
+        let shallow = base.join("a/b");
+        fs::create_dir_all(&shallow).unwrap();
+        fs::write(shallow.join("shallow.txt"), "needle\n").unwrap();
+
+        let mut deep = base.clone();
+        for i in 0..(GREP_MAX_DEPTH + 5) {
+            deep = deep.join(format!("d{i}"));
+        }
+        fs::create_dir_all(&deep).unwrap();
+        fs::write(deep.join("deep.txt"), "needle\n").unwrap();
+
+        let out = grep_search(&mk_input(&base, "needle")).unwrap();
+        let names: Vec<String> = out
+            .filenames
+            .iter()
+            .map(|f| f.rsplit('/').next().unwrap().to_string())
+            .collect();
+        assert!(names.contains(&"shallow.txt".to_string()));
+        assert!(
+            !names.contains(&"deep.txt".to_string()),
+            "deep file should be excluded; got {names:?}"
+        );
         let _ = fs::remove_dir_all(&base);
     }
 }
