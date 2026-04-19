@@ -6,6 +6,7 @@ use crossterm::style::{Color, Print, ResetColor, SetForegroundColor, Stylize};
 use crossterm::terminal::{Clear, ClearType};
 use crossterm::{execute, queue};
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
+use unicode_width::UnicodeWidthStr;
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{Theme, ThemeSet};
 use syntect::parsing::SyntaxSet;
@@ -885,7 +886,7 @@ fn line_closes_fence(line: &str, opener: FenceMarker) -> bool {
 }
 
 fn visible_width(input: &str) -> usize {
-    strip_ansi(input).chars().count()
+    UnicodeWidthStr::width(strip_ansi(input).as_str())
 }
 
 fn strip_ansi(input: &str) -> String {

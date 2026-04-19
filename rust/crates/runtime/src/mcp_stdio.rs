@@ -1142,7 +1142,7 @@ impl McpServerManager {
 #[derive(Debug)]
 pub struct McpStdioProcess {
     child: Child,
-    stdin: ChildStdin,
+    stdin: Option<ChildStdin>,
     stdout: BufReader<ChildStdout>,
 }
 
@@ -1168,17 +1168,25 @@ impl McpStdioProcess {
 
         Ok(Self {
             child,
-            stdin,
+            stdin: Some(stdin),
             stdout: BufReader::new(stdout),
         })
     }
 
     pub async fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
-        self.stdin.write_all(bytes).await
+        let stdin = self
+            .stdin
+            .as_mut()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "MCP stdin closed"))?;
+        stdin.write_all(bytes).await
     }
 
     pub async fn flush(&mut self) -> io::Result<()> {
-        self.stdin.flush().await
+        let stdin = self
+            .stdin
+            .as_mut()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "MCP stdin closed"))?;
+        stdin.flush().await
     }
 
     pub async fn write_line(&mut self, line: &str) -> io::Result<()> {
@@ -1212,15 +1220,34 @@ impl McpStdioProcess {
         self.flush().await
     }
 
+    /// Check whether the child process is still alive. Returns `Ok(())` when
+    /// alive; `Err(UnexpectedEof)` with exit status when it has already exited.
+    pub fn check_alive(&mut self) -> io::Result<()> {
+        match self.child.try_wait()? {
+            Some(status) => Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("MCP server process exited unexpectedly ({})", status),
+            )),
+            None => Ok(()),
+        }
+    }
+
     pub async fn read_frame(&mut self) -> io::Result<Vec<u8>> {
         let mut content_length = None;
         loop {
             let mut line = String::new();
             let bytes_read = self.stdout.read_line(&mut line).await?;
             if bytes_read == 0 {
+                // Enrich the error with exit status if the child has exited.
+                let status_detail = self
+                    .child
+                    .try_wait()
+                    .ok()
+                    .flatten()
+                    .map_or_else(|| String::new(), |s| format!(" ({})", s));
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
-                    "MCP stdio stream closed while reading headers",
+                    format!("MCP stdio stream closed while reading headers{status_detail}"),
                 ));
             }
             if line == "\r\n" {
@@ -1275,32 +1302,77 @@ impl McpStdioProcess {
         method: impl Into<String>,
         params: Option<TParams>,
     ) -> io::Result<JsonRpcResponse<TResult>> {
+        // Watchdog: fail fast if the server process has already exited so the
+        // caller gets a clear error instead of a misleading EOF on the next read.
+        self.check_alive()?;
         let method = method.into();
         let request = JsonRpcRequest::new(id.clone(), method.clone(), params);
         self.send_request(&request).await?;
-        let response = self.read_response().await?;
 
-        if response.jsonrpc != "2.0" {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "MCP response for {method} used unsupported jsonrpc version `{}`",
-                    response.jsonrpc
-                ),
-            ));
+        // Loop until we see the response that matches our request id. MCP
+        // servers may legally emit notifications (e.g. `notifications/progress`,
+        // `notifications/message`) or even server→client requests
+        // (`sampling/createMessage`, `roots/list`) between our send and the
+        // matching response. A plain `read_response()` choked on the missing
+        // `id` field and failed the call. Skip non-matching messages instead.
+        loop {
+            let payload = self.read_frame().await?;
+            let raw: serde_json::Value = serde_json::from_slice(&payload)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+            let has_method = raw.get("method").is_some();
+            let has_id = raw.get("id").is_some();
+
+            if has_method && !has_id {
+                // Server notification — discard.
+                continue;
+            }
+            if has_method && has_id {
+                // Server-initiated request. We do not yet have a handler loop
+                // wired up through this type, so reply with a standard
+                // "Method not found" error so the server is not left hanging,
+                // then keep waiting for our own response.
+                let server_id = raw.get("id").cloned().unwrap_or(serde_json::Value::Null);
+                let reply = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": server_id,
+                    "error": {
+                        "code": -32601,
+                        "message": "Method not found (claw does not yet handle server-initiated MCP requests)",
+                    }
+                });
+                if let Ok(bytes) = serde_json::to_vec(&reply) {
+                    let _ = self.write_frame(&bytes).await;
+                }
+                continue;
+            }
+
+            // Response path — must parse into JsonRpcResponse<TResult>.
+            let response: JsonRpcResponse<TResult> = serde_json::from_value(raw)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+            if response.jsonrpc != "2.0" {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "MCP response for {method} used unsupported jsonrpc version `{}`",
+                        response.jsonrpc
+                    ),
+                ));
+            }
+
+            if response.id != id {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "MCP response for {method} used mismatched id: expected {id:?}, got {:?}",
+                        response.id
+                    ),
+                ));
+            }
+
+            return Ok(response);
         }
-
-        if response.id != id {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "MCP response for {method} used mismatched id: expected {id:?}, got {:?}",
-                    response.id
-                ),
-            ));
-        }
-
-        Ok(response)
     }
 
     pub async fn initialize(
@@ -1356,11 +1428,27 @@ impl McpStdioProcess {
     }
 
     async fn shutdown(&mut self) -> io::Result<()> {
+        // MCP graceful shutdown protocol: close stdin to signal EOF, give the
+        // server a brief window to exit on its own, then fall back to SIGKILL.
+        // This lets well-behaved servers flush state and log cleanly instead of
+        // dying mid-syscall.
+        if let Some(stdin) = self.stdin.take() {
+            drop(stdin);
+        }
+
+        const GRACEFUL_EXIT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
         if self.child.try_wait()?.is_none() {
-            match self.child.kill().await {
-                Ok(()) => {}
-                Err(error) if error.kind() == io::ErrorKind::InvalidInput => {}
-                Err(error) => return Err(error),
+            match tokio::time::timeout(GRACEFUL_EXIT_TIMEOUT, self.child.wait()).await {
+                Ok(Ok(_)) => return Ok(()),
+                Ok(Err(error)) => return Err(error),
+                Err(_) => {
+                    // Timed out waiting for graceful exit — force-kill.
+                    match self.child.kill().await {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == io::ErrorKind::InvalidInput => {}
+                        Err(error) => return Err(error),
+                    }
+                }
             }
         }
         let _ = self.child.wait().await?;
@@ -1467,6 +1555,7 @@ mod tests {
             "import json, os, sys",
             "LOWERCASE_CONTENT_LENGTH = os.environ.get('MCP_LOWERCASE_CONTENT_LENGTH') == '1'",
             "MISMATCHED_RESPONSE_ID = os.environ.get('MCP_MISMATCHED_RESPONSE_ID') == '1'",
+            "EMIT_NOTIFICATION = os.environ.get('MCP_EMIT_NOTIFICATION') == '1'",
             "header = b''",
             r"while not header.endswith(b'\r\n\r\n'):",
             "    chunk = sys.stdin.buffer.read(1)",
@@ -1483,6 +1572,10 @@ mod tests {
             r"assert request['method'] == 'initialize'",
             "response_id = 'wrong-id' if MISMATCHED_RESPONSE_ID else request['id']",
             "header_name = 'content-length' if LOWERCASE_CONTENT_LENGTH else 'Content-Length'",
+            "if EMIT_NOTIFICATION:",
+            r"    notif = json.dumps({'jsonrpc': '2.0', 'method': 'notifications/message', 'params': {'level': 'info', 'data': 'hello'}}).encode()",
+            r"    sys.stdout.buffer.write(f'{header_name}: {len(notif)}\r\n\r\n'.encode() + notif)",
+            "    sys.stdout.buffer.flush()",
             r"response = json.dumps({",
             r"    'jsonrpc': '2.0',",
             r"    'id': response_id,",
@@ -2036,6 +2129,46 @@ mod tests {
 
             assert_eq!(error.kind(), ErrorKind::InvalidData);
             assert!(error.to_string().contains("mismatched id"));
+
+            let status = process.wait().await.expect("wait for exit");
+            assert!(status.success());
+
+            cleanup_script(&script_path);
+        });
+    }
+
+    #[test]
+    fn given_server_notification_before_response_then_initialize_still_succeeds() {
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let script_path = write_jsonrpc_script();
+            let transport = script_transport_with_env(
+                &script_path,
+                BTreeMap::from([("MCP_EMIT_NOTIFICATION".to_string(), "1".to_string())]),
+            );
+            let mut process =
+                McpStdioProcess::spawn(&transport).expect("spawn transport directly");
+
+            let response = process
+                .initialize(
+                    JsonRpcId::Number(7),
+                    McpInitializeParams {
+                        protocol_version: "2025-03-26".to_string(),
+                        capabilities: json!({"roots": {}}),
+                        client_info: McpInitializeClientInfo {
+                            name: "runtime-tests".to_string(),
+                            version: "0.1.0".to_string(),
+                        },
+                    },
+                )
+                .await
+                .expect("notification before response should be skipped");
+
+            assert_eq!(response.id, JsonRpcId::Number(7));
+            assert!(response.result.is_some());
 
             let status = process.wait().await.expect("wait for exit");
             assert!(status.success());

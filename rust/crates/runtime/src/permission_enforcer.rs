@@ -175,6 +175,8 @@ impl PermissionEnforcer {
 
 /// Simple workspace boundary check via string prefix.
 fn is_within_workspace(path: &str, workspace_root: &str) -> bool {
+    use std::path::Path;
+
     let normalized = if path.starts_with('/') {
         path.to_owned()
     } else {
@@ -187,7 +189,12 @@ fn is_within_workspace(path: &str, workspace_root: &str) -> bool {
         format!("{workspace_root}/")
     };
 
-    normalized.starts_with(&root) || normalized == workspace_root.trim_end_matches('/')
+    // Resolve symlinks when possible so a symlink pointing outside the
+    // workspace cannot bypass this check.
+    let canonical = std::fs::canonicalize(&normalized).unwrap_or_else(|_| Path::new(&normalized).to_path_buf());
+    let canonical_str = canonical.to_string_lossy();
+
+    canonical_str.starts_with(&root) || canonical_str == workspace_root.trim_end_matches('/')
 }
 
 /// Conservative heuristic: is this bash command read-only?

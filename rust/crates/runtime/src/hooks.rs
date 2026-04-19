@@ -1,7 +1,7 @@
 use std::ffi::OsStr;
 use std::fmt::Write as FmtWrite;
-use std::io::Write;
-use std::process::{Command, Stdio};
+use std::io::{Read, Write};
+use std::process::{Command, ExitStatus, Output, Stdio};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -15,6 +15,7 @@ use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
 use crate::permissions::PermissionOverride;
 
 const HOOK_PREVIEW_CHAR_LIMIT: usize = 160;
+const HOOK_EXECUTION_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub type HookPermissionDecision = PermissionOverride;
 
@@ -436,7 +437,17 @@ impl HookRunner {
             child.env("HOOK_TOOL_OUTPUT", tool_output);
         }
 
-        match child.output_with_stdin(payload.as_bytes(), abort_signal) {
+        match child.output_with_stdin(payload.as_bytes(), abort_signal, HOOK_EXECUTION_TIMEOUT) {
+            Ok(CommandExecution::TimedOut) => HookCommandOutcome::Failed {
+                parsed: ParsedHookOutput {
+                    messages: vec![format!(
+                        "{} hook `{command}` timed out after {}s while handling `{tool_name}`",
+                        event.as_str(),
+                        HOOK_EXECUTION_TIMEOUT.as_secs(),
+                    )],
+                    ..Default::default()
+                },
+            },
             Ok(CommandExecution::Finished(output)) => {
                 let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
                 let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -735,6 +746,24 @@ fn format_hook_failure(command: &str, code: i32, stdout: Option<&str>, stderr: &
     message
 }
 
+/// Kill the process group that `child` belongs to (Unix) or just the child
+/// process (Windows), so forked sub-processes don't become orphans.
+fn kill_process_group(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        // child.id() is the PGID we set with process_group(0).
+        let pgid = child.id();
+        let _ = Command::new("kill")
+            .arg("-9")
+            .arg(format!("-{pgid}"))
+            .status();
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = child.kill();
+    }
+}
+
 fn shell_command(command: &str) -> CommandWithStdin {
     #[cfg(windows)]
     let mut command_builder = {
@@ -745,8 +774,13 @@ fn shell_command(command: &str) -> CommandWithStdin {
 
     #[cfg(not(windows))]
     let command_builder = {
+        use std::os::unix::process::CommandExt;
         let mut command_builder = Command::new("sh");
         command_builder.arg("-lc").arg(command);
+        // Put the child in its own process group so kill_process_group() can
+        // reap all child-of-child processes (e.g. long-running scripts that
+        // fork sub-shells) when a timeout or abort fires.
+        command_builder.process_group(0);
         CommandWithStdin::new(command_builder)
     };
 
@@ -790,30 +824,106 @@ impl CommandWithStdin {
         &mut self,
         stdin: &[u8],
         abort_signal: Option<&HookAbortSignal>,
+        timeout: Duration,
     ) -> std::io::Result<CommandExecution> {
         let mut child = self.command.spawn()?;
-        if let Some(mut child_stdin) = child.stdin.take() {
-            child_stdin.write_all(stdin)?;
-        }
+        let started_at = std::time::Instant::now();
 
-        loop {
+        // Drain stdin / stdout / stderr concurrently so a child that writes more
+        // than the OS pipe buffer (~64KB) while we are still feeding stdin does
+        // not deadlock waiting for the reader side.
+        let stdin_bytes = stdin.to_vec();
+        let stdin_handle = child.stdin.take().map(|mut pipe| {
+            thread::spawn(move || -> std::io::Result<()> {
+                pipe.write_all(&stdin_bytes)?;
+                // Dropping `pipe` here closes stdin so the child sees EOF.
+                Ok(())
+            })
+        });
+
+        let stdout_handle = child.stdout.take().map(|mut pipe| {
+            thread::spawn(move || -> std::io::Result<Vec<u8>> {
+                let mut buf = Vec::new();
+                pipe.read_to_end(&mut buf)?;
+                Ok(buf)
+            })
+        });
+
+        let stderr_handle = child.stderr.take().map(|mut pipe| {
+            thread::spawn(move || -> std::io::Result<Vec<u8>> {
+                let mut buf = Vec::new();
+                pipe.read_to_end(&mut buf)?;
+                Ok(buf)
+            })
+        });
+
+        let status: ExitStatus = loop {
             if abort_signal.is_some_and(HookAbortSignal::is_aborted) {
-                let _ = child.kill();
-                let _ = child.wait_with_output();
+                kill_process_group(&mut child);
+                let _ = child.wait();
+                // Drain IO threads so we don't leak them.
+                if let Some(h) = stdin_handle {
+                    let _ = h.join();
+                }
+                if let Some(h) = stdout_handle {
+                    let _ = h.join();
+                }
+                if let Some(h) = stderr_handle {
+                    let _ = h.join();
+                }
                 return Ok(CommandExecution::Cancelled);
             }
 
+            if started_at.elapsed() >= timeout {
+                kill_process_group(&mut child);
+                let _ = child.wait();
+                if let Some(h) = stdin_handle {
+                    let _ = h.join();
+                }
+                if let Some(h) = stdout_handle {
+                    let _ = h.join();
+                }
+                if let Some(h) = stderr_handle {
+                    let _ = h.join();
+                }
+                return Ok(CommandExecution::TimedOut);
+            }
+
             match child.try_wait()? {
-                Some(_) => return child.wait_with_output().map(CommandExecution::Finished),
+                Some(status) => break status,
                 None => thread::sleep(Duration::from_millis(20)),
             }
+        };
+
+        // Writer may return EPIPE when the child exits early; that's not fatal.
+        if let Some(h) = stdin_handle {
+            let _ = h.join();
         }
+        let stdout = match stdout_handle {
+            Some(h) => h
+                .join()
+                .map_err(|_| std::io::Error::other("hook stdout reader panicked"))??,
+            None => Vec::new(),
+        };
+        let stderr = match stderr_handle {
+            Some(h) => h
+                .join()
+                .map_err(|_| std::io::Error::other("hook stderr reader panicked"))??,
+            None => Vec::new(),
+        };
+
+        Ok(CommandExecution::Finished(Output {
+            status,
+            stdout,
+            stderr,
+        }))
     }
 }
 
 enum CommandExecution {
     Finished(std::process::Output),
     Cancelled,
+    TimedOut,
 }
 
 #[cfg(test)]
@@ -1102,6 +1212,25 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn handles_large_stdin_and_large_stdout_without_deadlock() {
+        // `tee` copies >1MB from stdin to stdout. Without concurrent stdin/stdout
+        // draining this blocked at ~64KB (OS pipe buffer) and never returned.
+        let big_payload: String = "a".repeat(256 * 1024);
+        let runner = HookRunner::new(RuntimeHookConfig::new(
+            vec![shell_snippet("cat; printf done")],
+            Vec::new(),
+            Vec::new(),
+        ));
+
+        // The payload is injected via tool_input; the hook reads it from stdin
+        // through the standard post-tool-use protocol.
+        let tool_input = format!("{{\"data\":\"{big_payload}\"}}");
+        let result = runner.run_pre_tool_use("Bash", &tool_input);
+        assert!(!result.is_denied());
     }
 
     #[cfg(windows)]

@@ -1,5 +1,4 @@
 use std::fs;
-use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -372,9 +371,9 @@ fn normalize_instruction_content(content: &str) -> String {
 }
 
 fn stable_content_hash(content: &str) -> u64 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    content.hash(&mut hasher);
-    hasher.finish()
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(content.as_bytes());
+    u64::from_be_bytes(digest[..8].try_into().unwrap_or([0; 8]))
 }
 
 fn describe_instruction_file(file: &ContextFile, files: &[ContextFile]) -> String {

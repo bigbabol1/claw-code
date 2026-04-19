@@ -347,18 +347,16 @@ pub fn compute_event_fingerprint(
     status: &LaneEventStatus,
     data: Option<&serde_json::Value>,
 ) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
+    use sha2::{Digest, Sha256};
 
-    let mut hasher = DefaultHasher::new();
-    format!("{event:?}").hash(&mut hasher);
-    format!("{status:?}").hash(&mut hasher);
+    let mut hasher = Sha256::new();
+    hasher.update(format!("{event:?}").as_bytes());
+    hasher.update(format!("{status:?}").as_bytes());
     if let Some(d) = data {
-        serde_json::to_string(d)
-            .unwrap_or_default()
-            .hash(&mut hasher);
+        hasher.update(serde_json::to_string(d).unwrap_or_default().as_bytes());
     }
-    format!("{:016x}", hasher.finish())
+    let digest = hasher.finalize();
+    format!("{:016x}", u64::from_be_bytes(digest[..8].try_into().unwrap_or([0; 8])))
 }
 
 /// Deduplicate terminal events within a reconciliation window.

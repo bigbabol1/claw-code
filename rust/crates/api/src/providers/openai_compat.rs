@@ -781,7 +781,7 @@ fn strip_routing_prefix(model: &str) -> &str {
         let prefix = &model[..pos];
         // Only strip if the prefix before "/" is a known routing prefix,
         // not if "/" appears in the middle of the model name for other reasons.
-        if matches!(prefix, "openai" | "xai" | "grok" | "qwen") {
+        if matches!(prefix, "dashscope" | "openai" | "xai" | "grok" | "qwen") {
             &model[pos + 1..]
         } else {
             model
@@ -826,10 +826,14 @@ pub fn build_chat_completion_request(request: &MessageRequest, config: OpenAiCom
 
     let mut payload = json!({
         "model": wire_model,
-        max_tokens_key: request.max_tokens,
         "messages": messages,
         "stream": request.stream,
     });
+    // Only emit max_tokens when the caller supplied a positive value;
+    // sending 0 is rejected by most providers with a 400 error.
+    if request.max_tokens > 0 {
+        payload[max_tokens_key] = json!(request.max_tokens);
+    }
 
     if request.stream && should_request_stream_usage(config) {
         payload["stream_options"] = json!({ "include_usage": true });
@@ -1873,6 +1877,16 @@ mod tests {
         assert!(!super::model_rejects_is_error_field("xai/grok-3"));
         assert!(!super::model_rejects_is_error_field("qwen/qwen-plus"));
         assert!(!super::model_rejects_is_error_field("o1-mini"));
+    }
+
+    #[test]
+    fn strip_routing_prefix_handles_dashscope() {
+        assert_eq!(super::strip_routing_prefix("dashscope/qwen-plus"), "qwen-plus");
+        assert_eq!(super::strip_routing_prefix("dashscope/kimi-k2.5"), "kimi-k2.5");
+        assert_eq!(super::strip_routing_prefix("openai/gpt-4o"), "gpt-4o");
+        assert_eq!(super::strip_routing_prefix("gpt-4o"), "gpt-4o");
+        // Unknown prefix passes through unchanged.
+        assert_eq!(super::strip_routing_prefix("unknown/model"), "unknown/model");
     }
 
     #[test]

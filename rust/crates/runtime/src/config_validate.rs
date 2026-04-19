@@ -26,6 +26,12 @@ pub enum DiagnosticKind {
     Deprecated {
         replacement: &'static str,
     },
+    ConflictingKeys {
+        /// The key that was ignored because the other key takes precedence.
+        ignored: &'static str,
+        /// The key whose value was used.
+        used: &'static str,
+    },
 }
 
 impl std::fmt::Display for ConfigDiagnostic {
@@ -58,6 +64,13 @@ impl std::fmt::Display for ConfigDiagnostic {
                     f,
                     "{}: field \"{}\" is deprecated{location}. Use \"{replacement}\" instead",
                     self.path, self.field
+                )
+            }
+            DiagnosticKind::ConflictingKeys { ignored, used } => {
+                write!(
+                    f,
+                    "{}: field \"{}\" conflicts with \"{used}\"{location}. \"{ignored}\" was ignored; remove it to avoid confusion",
+                    self.path, ignored
                 )
             }
         }
@@ -453,6 +466,26 @@ pub fn validate_config_file(
                 },
             });
         }
+    }
+
+    // Warn when both the deprecated `permissionMode` top-level key and the
+    // canonical `permissions.defaultMode` key are present — the deprecated key
+    // takes precedence in the reader, so the canonical one is silently ignored.
+    let has_legacy_mode = object.contains_key("permissionMode");
+    let has_canonical_mode = object
+        .get("permissions")
+        .and_then(JsonValue::as_object)
+        .is_some_and(|p| p.contains_key("defaultMode"));
+    if has_legacy_mode && has_canonical_mode {
+        result.warnings.push(ConfigDiagnostic {
+            path: path_display.clone(),
+            field: "permissions.defaultMode".to_string(),
+            line: find_key_line(source, "defaultMode"),
+            kind: DiagnosticKind::ConflictingKeys {
+                ignored: "permissions.defaultMode",
+                used: "permissionMode",
+            },
+        });
     }
 
     // Validate known nested objects.

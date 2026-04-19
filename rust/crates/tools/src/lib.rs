@@ -10,6 +10,7 @@ use api::{
 };
 use plugins::PluginTool;
 use reqwest::blocking::Client;
+use runtime::bash_validation;
 use runtime::{
     check_freshness, dedupe_superseded_commit_events, edit_file, execute_bash, glob_search,
     grep_search, load_system_prompt,
@@ -380,9 +381,16 @@ fn permission_mode_from_plugin(value: &str) -> Result<PermissionMode, String> {
     }
 }
 
+static MVP_TOOL_SPECS: std::sync::LazyLock<Vec<ToolSpec>> =
+    std::sync::LazyLock::new(build_mvp_tool_specs);
+
 #[must_use]
-#[allow(clippy::too_many_lines)]
 pub fn mvp_tool_specs() -> Vec<ToolSpec> {
+    MVP_TOOL_SPECS.clone()
+}
+
+#[allow(clippy::too_many_lines)]
+fn build_mvp_tool_specs() -> Vec<ToolSpec> {
     vec![
         ToolSpec {
             name: "bash",
@@ -1325,11 +1333,16 @@ fn maybe_enforce_permission_check_with_mode(
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_ask_user_question(input: AskUserQuestionInput) -> Result<String, String> {
-    use std::io::{self, BufRead, Write};
+    use std::io::{self, BufRead, IsTerminal, Write};
 
-    // Display the question to the user via stdout
     let stdout = io::stdout();
     let stdin = io::stdin();
+
+    if !stdin.is_terminal() {
+        return Err(
+            "AskUserQuestion requires an interactive terminal; stdin is not a tty".to_string(),
+        );
+    }
     let mut out = stdout.lock();
 
     writeln!(out, "\n[Question] {}", input.question).map_err(|e| e.to_string())?;
@@ -1779,15 +1792,28 @@ fn run_remote_trigger(input: RemoteTriggerInput) -> Result<String, String> {
     match request.send() {
         Ok(response) => {
             let status = response.status().as_u16();
-            let body = response.text().unwrap_or_default();
-            let truncated_body = if body.len() > 8192 {
-                format!(
-                    "{}\n\n[response truncated — {} bytes total]",
-                    &body[..8192],
-                    body.len()
+            // Read at most 8 KiB from the response body so a huge remote
+            // payload cannot exhaust memory.
+            const MAX_BODY_BYTES: usize = 8192;
+            let raw_bytes = response.bytes().unwrap_or_default();
+            let (truncated_body, was_truncated) = if raw_bytes.len() > MAX_BODY_BYTES {
+                (
+                    String::from_utf8_lossy(&raw_bytes[..MAX_BODY_BYTES]).into_owned(),
+                    true,
                 )
             } else {
-                body
+                (
+                    String::from_utf8_lossy(&raw_bytes).into_owned(),
+                    false,
+                )
+            };
+            let truncated_body = if was_truncated {
+                format!(
+                    "{truncated_body}\n\n[response truncated — {} bytes total]",
+                    raw_bytes.len()
+                )
+            } else {
+                truncated_body
             };
             to_pretty_json(json!({
                 "url": input.url,
@@ -1842,35 +1868,91 @@ fn from_value<T: for<'de> Deserialize<'de>>(input: &Value) -> Result<T, String> 
 /// ROADMAP #50: Read-only commands targeting CWD paths get `WorkspaceWrite`,
 /// all others remain `DangerFullAccess`.
 fn classify_bash_permission(command: &str) -> PermissionMode {
-    // Read-only commands that are safe when targeting workspace paths
+    // Read-only commands that are safe when targeting workspace paths.
+    // `sed` is handled separately via bash_validation::validate_sed because
+    // `sed -i` mutates files and must not be classified as read-only.
     const READ_ONLY_COMMANDS: &[&str] = &[
         "cat", "head", "tail", "less", "more", "ls", "ll", "dir", "find", "test", "[", "[[",
-        "grep", "rg", "awk", "sed", "file", "stat", "readlink", "wc", "sort", "uniq", "cut", "tr",
-        "pwd", "echo", "printf",
+        "grep", "rg", "awk", "file", "stat", "readlink", "wc", "sort", "uniq", "cut", "tr", "pwd",
+        "echo", "printf",
     ];
 
-    // Get the base command (first word before any args or pipes)
-    let base_cmd = command.split_whitespace().next().unwrap_or("");
-    let base_cmd = base_cmd.split('|').next().unwrap_or("").trim();
-    let base_cmd = base_cmd.split(';').next().unwrap_or("").trim();
-    let base_cmd = base_cmd.split('>').next().unwrap_or("").trim();
-    let base_cmd = base_cmd.split('<').next().unwrap_or("").trim();
-
-    // Check if it's a read-only command
-    let cmd_name = base_cmd.split('/').next_back().unwrap_or(base_cmd);
-    let is_read_only = READ_ONLY_COMMANDS.contains(&cmd_name);
-
-    if !is_read_only {
+    let segments = bash_validation::split_command_chain(command);
+    if segments.is_empty() {
         return PermissionMode::DangerFullAccess;
     }
 
-    // Check if any path argument is outside workspace
-    // Simple heuristic: check for absolute paths not starting with CWD
+    for segment in &segments {
+        // Any write-style redirection in a segment disqualifies read-only.
+        if segment_has_write_redirection(segment) {
+            return PermissionMode::DangerFullAccess;
+        }
+
+        let base_cmd = segment.split_whitespace().next().unwrap_or("").trim();
+        let cmd_name = base_cmd.split('/').next_back().unwrap_or(base_cmd);
+
+        if cmd_name == "sed" {
+            // Block sed -i; stdout-only sed is read-only.
+            let result =
+                bash_validation::validate_sed(segment, PermissionMode::ReadOnly);
+            if result != bash_validation::ValidationResult::Allow {
+                return PermissionMode::DangerFullAccess;
+            }
+            continue;
+        }
+
+        if !READ_ONLY_COMMANDS.contains(&cmd_name) {
+            return PermissionMode::DangerFullAccess;
+        }
+    }
+
     if has_dangerous_paths(command) {
         return PermissionMode::DangerFullAccess;
     }
 
     PermissionMode::WorkspaceWrite
+}
+
+/// Detect write-style `>` / `>>` redirections in a single segment, skipping
+/// content inside single or double quotes so `echo ">"` does not count.
+fn segment_has_write_redirection(segment: &str) -> bool {
+    let bytes = segment.as_bytes();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_single {
+            if b == b'\'' {
+                in_single = false;
+            }
+            i += 1;
+            continue;
+        }
+        if in_double {
+            if b == b'\\' && i + 1 < bytes.len() {
+                i += 2;
+                continue;
+            }
+            if b == b'"' {
+                in_double = false;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'\'' => in_single = true,
+            b'"' => in_double = true,
+            b'\\' if i + 1 < bytes.len() => {
+                i += 2;
+                continue;
+            }
+            b'>' => return true,
+            _ => {}
+        }
+        i += 1;
+    }
+    false
 }
 
 /// Check if command has dangerous paths (outside workspace).
@@ -1922,7 +2004,7 @@ fn workspace_test_branch_preflight(command: &str) -> Option<BashCommandOutput> {
     let main_ref = resolve_main_ref(&branch)?;
     let freshness = check_freshness(&branch, &main_ref);
     match freshness {
-        BranchFreshness::Fresh => None,
+        BranchFreshness::Fresh | BranchFreshness::GitUnavailable => None,
         BranchFreshness::Stale {
             commits_behind,
             missing_fixes,
@@ -2609,12 +2691,14 @@ struct AgentOutput {
     error: Option<String>,
 }
 
-#[derive(Debug, Clone)]
 struct AgentJob {
     manifest: AgentOutput,
     prompt: String,
     system_prompt: Vec<String>,
     allowed_tools: BTreeSet<String>,
+    /// Held for the life of the job so the active-agent counter is released
+    /// only after the spawned thread actually finishes.
+    _slot: AgentSlotGuard,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -3474,6 +3558,46 @@ const DEFAULT_AGENT_MODEL: &str = "claude-opus-4-6";
 const DEFAULT_AGENT_SYSTEM_DATE: &str = "2026-03-31";
 const DEFAULT_AGENT_MAX_ITERATIONS: usize = 32;
 
+/// Hard cap on concurrently-running sub-agent threads. A sub-agent can in turn
+/// call the `Agent` tool, so without a cap a misbehaving (or adversarial) task
+/// could fork-bomb the process. 8 is well above any realistic fan-out that a
+/// human operator would set up deliberately.
+const AGENT_MAX_ACTIVE: usize = 8;
+
+static AGENT_ACTIVE_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// RAII guard that decrements `AGENT_ACTIVE_COUNT` on drop.
+struct AgentSlotGuard;
+
+impl AgentSlotGuard {
+    /// Reserve a slot, returning `None` when the hard cap is already reached.
+    fn acquire() -> Option<Self> {
+        use std::sync::atomic::Ordering;
+        let mut current = AGENT_ACTIVE_COUNT.load(Ordering::SeqCst);
+        loop {
+            if current >= AGENT_MAX_ACTIVE {
+                return None;
+            }
+            match AGENT_ACTIVE_COUNT.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return Some(Self),
+                Err(observed) => current = observed,
+            }
+        }
+    }
+}
+
+impl Drop for AgentSlotGuard {
+    fn drop(&mut self) {
+        AGENT_ACTIVE_COUNT.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 fn execute_agent(input: AgentInput) -> Result<AgentOutput, String> {
     execute_agent_with_spawn(input, spawn_agent_job)
 }
@@ -3542,12 +3666,21 @@ where
     };
     write_agent_manifest(&manifest)?;
 
+    let Some(slot) = AgentSlotGuard::acquire() else {
+        let error = format!(
+            "sub-agent spawn refused: {AGENT_MAX_ACTIVE} agents already running (limit reached — resolve an existing agent before spawning another)"
+        );
+        persist_agent_terminal_state(&manifest, "failed", None, Some(error.clone()))?;
+        return Err(error);
+    };
+
     let manifest_for_spawn = manifest.clone();
     let job = AgentJob {
         manifest: manifest_for_spawn,
         prompt: input.prompt,
         system_prompt,
         allowed_tools,
+        _slot: slot,
     };
     if let Err(error) = spawn_fn(job) {
         let error = format!("failed to spawn sub-agent: {error}");
@@ -7761,14 +7894,15 @@ mod tests {
         assert_eq!(manifest_json["laneEvents"][0]["event"], "lane.started");
         assert_eq!(manifest_json["laneEvents"][0]["status"], "running");
         assert!(manifest_json["currentBlocker"].is_null());
-        let captured_job = captured
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
-            .expect("spawn job should be captured");
-        assert_eq!(captured_job.prompt, "Check tests and outstanding work.");
-        assert!(captured_job.allowed_tools.contains("read_file"));
-        assert!(!captured_job.allowed_tools.contains("Agent"));
+        {
+            let guard = captured
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let captured_job = guard.as_ref().expect("spawn job should be captured");
+            assert_eq!(captured_job.prompt, "Check tests and outstanding work.");
+            assert!(captured_job.allowed_tools.contains("read_file"));
+            assert!(!captured_job.allowed_tools.contains("Agent"));
+        }
 
         let normalized = execute_tool(
             "Agent",
@@ -7794,6 +7928,85 @@ mod tests {
         .expect("Agent should normalize explicit names");
         let named_output: serde_json::Value = serde_json::from_str(&named).expect("valid json");
         assert_eq!(named_output["name"], "ship-audit");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn agent_spawn_cap_refuses_once_limit_reached() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = temp_path("agent-cap");
+        std::env::set_var("CLAWD_AGENT_STORE", &dir);
+
+        // Hold slots by capturing the AgentJob (which owns the guard) so it
+        // never drops until this test frees them.
+        let mut held_jobs: Vec<AgentJob> = Vec::new();
+        for i in 0..super::AGENT_MAX_ACTIVE {
+            let parked = Arc::new(Mutex::new(None::<AgentJob>));
+            let parked_for_spawn = Arc::clone(&parked);
+            execute_agent_with_spawn(
+                AgentInput {
+                    description: format!("task-{i}"),
+                    prompt: "work".to_string(),
+                    subagent_type: None,
+                    name: None,
+                    model: None,
+                },
+                move |job| {
+                    *parked_for_spawn
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(job);
+                    Ok(())
+                },
+            )
+            .expect("spawn within cap should succeed");
+            let job = parked
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+                .expect("job captured");
+            held_jobs.push(job);
+        }
+
+        // Cap reached — next spawn must refuse without calling the spawn fn.
+        let spawn_fn_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = Arc::clone(&spawn_fn_called);
+        let refused = execute_agent_with_spawn(
+            AgentInput {
+                description: "over-cap".to_string(),
+                prompt: "should fail".to_string(),
+                subagent_type: None,
+                name: None,
+                model: None,
+            },
+            move |_job| {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            },
+        );
+        assert!(refused.is_err(), "spawn beyond cap must return Err");
+        assert!(
+            !spawn_fn_called.load(std::sync::atomic::Ordering::SeqCst),
+            "spawn_fn must not be called when cap is exceeded"
+        );
+
+        // Drop a slot and confirm a new spawn is accepted again.
+        held_jobs.pop();
+        let after = execute_agent_with_spawn(
+            AgentInput {
+                description: "after-release".to_string(),
+                prompt: "ok now".to_string(),
+                subagent_type: None,
+                name: None,
+                model: None,
+            },
+            |_job| Ok(()),
+        );
+        assert!(after.is_ok(), "spawn after release should succeed");
+
+        drop(held_jobs);
+        std::env::remove_var("CLAWD_AGENT_STORE");
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -9681,5 +9894,20 @@ printf 'pwsh:%s' "$1"
             )
             .into_bytes()
         }
+    }
+
+    #[test]
+    fn ask_user_question_refuses_when_stdin_is_not_a_tty() {
+        use std::io::IsTerminal;
+        if std::io::stdin().is_terminal() {
+            // Running with an interactive terminal — skip; can't simulate non-tty here.
+            return;
+        }
+        let result = execute_tool("AskUserQuestion", &json!({"question": "Are you there?"}));
+        let err = result.expect_err("should fail in non-interactive context");
+        assert!(
+            err.contains("not a tty"),
+            "unexpected error message: {err}"
+        );
     }
 }

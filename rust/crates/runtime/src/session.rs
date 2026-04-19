@@ -246,6 +246,21 @@ impl Session {
         self.push_message(ConversationMessage::user_text(text))
     }
 
+    /// Remove the last message from the session and rewrite the persistence file.
+    /// Used to roll back a user message when the turn fails before any assistant
+    /// response is recorded, preventing consecutive user messages on the next turn.
+    pub fn pop_last_message(&mut self) -> Result<(), SessionError> {
+        if self.messages.pop().is_none() {
+            return Ok(());
+        }
+        self.touch();
+        if let Some(path) = self.persistence_path() {
+            let path = path.to_path_buf();
+            self.save_to_path(&path)?;
+        }
+        Ok(())
+    }
+
     pub fn record_compaction(&mut self, summary: impl Into<String>, removed_message_count: usize) {
         self.touch();
         let count = self.compaction.as_ref().map_or(1, |value| value.count + 1);

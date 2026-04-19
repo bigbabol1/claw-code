@@ -14,6 +14,8 @@ pub enum BranchFreshness {
         behind: usize,
         missing_fixes: Vec<String>,
     },
+    /// `git` was not found or failed to run; freshness cannot be determined.
+    GitUnavailable,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,7 +58,7 @@ pub fn check_freshness(branch: &str, main_ref: &str) -> BranchFreshness {
 
 pub fn apply_policy(freshness: &BranchFreshness, policy: StaleBranchPolicy) -> StaleBranchAction {
     match freshness {
-        BranchFreshness::Fresh => StaleBranchAction::Noop,
+        BranchFreshness::Fresh | BranchFreshness::GitUnavailable => StaleBranchAction::Noop,
         BranchFreshness::Stale {
             commits_behind,
             missing_fixes,
@@ -107,6 +109,18 @@ pub(crate) fn check_freshness_in(
     main_ref: &str,
     repo_path: &Path,
 ) -> BranchFreshness {
+    // Verify git is available before running rev-list queries. If the binary is
+    // missing or we are not inside a git repo, return GitUnavailable so callers
+    // can distinguish "fresh" from "could not check".
+    let git_ok = Command::new("git")
+        .args(["rev-parse", "--git-dir"])
+        .current_dir(repo_path)
+        .output()
+        .map_or(false, |o| o.status.success());
+    if !git_ok {
+        return BranchFreshness::GitUnavailable;
+    }
+
     let behind = rev_list_count(main_ref, branch, repo_path);
     let ahead = rev_list_count(branch, main_ref, repo_path);
 

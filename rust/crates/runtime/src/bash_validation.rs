@@ -105,9 +105,19 @@ pub fn validate_read_only(command: &str, mode: PermissionMode) -> ValidationResu
         return ValidationResult::Allow;
     }
 
+    for segment in split_command_chain(command) {
+        let result = validate_read_only_segment(segment, mode);
+        if result != ValidationResult::Allow {
+            return result;
+        }
+    }
+
+    ValidationResult::Allow
+}
+
+fn validate_read_only_segment(command: &str, mode: PermissionMode) -> ValidationResult {
     let first_command = extract_first_command(command);
 
-    // Check for write commands.
     for &write_cmd in WRITE_COMMANDS {
         if first_command == write_cmd {
             return ValidationResult::Block {
@@ -118,7 +128,6 @@ pub fn validate_read_only(command: &str, mode: PermissionMode) -> ValidationResu
         }
     }
 
-    // Check for state-modifying commands.
     for &state_cmd in STATE_MODIFYING_COMMANDS {
         if first_command == state_cmd {
             return ValidationResult::Block {
@@ -129,18 +138,16 @@ pub fn validate_read_only(command: &str, mode: PermissionMode) -> ValidationResu
         }
     }
 
-    // Check for sudo wrapping write commands.
     if first_command == "sudo" {
         let inner = extract_sudo_inner(command);
         if !inner.is_empty() {
-            let inner_result = validate_read_only(inner, mode);
+            let inner_result = validate_read_only_segment(inner, mode);
             if inner_result != ValidationResult::Allow {
                 return inner_result;
             }
         }
     }
 
-    // Check for write redirections.
     for &redir in WRITE_REDIRECTIONS {
         if command.contains(redir) {
             return ValidationResult::Block {
@@ -151,7 +158,6 @@ pub fn validate_read_only(command: &str, mode: PermissionMode) -> ValidationResu
         }
     }
 
-    // Check for git commands that modify state.
     if first_command == "git" {
         return validate_git_read_only(command);
     }
@@ -248,26 +254,26 @@ pub fn check_destructive(command: &str) -> ValidationResult {
         }
     }
 
-    // Check always-destructive commands.
-    let first = extract_first_command(command);
-    for &cmd in ALWAYS_DESTRUCTIVE_COMMANDS {
-        if first == cmd {
+    // Check always-destructive commands + rm -rf in any chained segment.
+    for segment in split_command_chain(command) {
+        let first = extract_first_command(segment);
+        for &cmd in ALWAYS_DESTRUCTIVE_COMMANDS {
+            if first == cmd {
+                return ValidationResult::Warn {
+                    message: format!(
+                        "Command '{cmd}' is inherently destructive and may cause data loss"
+                    ),
+                };
+            }
+        }
+        if first == "rm" && (segment.contains("-r") || segment.contains("-R"))
+            && segment.contains("-f")
+        {
             return ValidationResult::Warn {
-                message: format!(
-                    "Command '{cmd}' is inherently destructive and may cause data loss"
-                ),
+                message: "Recursive forced deletion detected — verify the target path is correct"
+                    .to_string(),
             };
         }
-    }
-
-    // Check for "rm -rf" with broad targets.
-    if command.contains("rm ") && command.contains("-r") && command.contains("-f") {
-        // Already handled the most dangerous patterns above.
-        // Flag any remaining "rm -rf" as a warning.
-        return ValidationResult::Warn {
-            message: "Recursive forced deletion detected — verify the target path is correct"
-                .to_string(),
-        };
     }
 
     ValidationResult::Allow
@@ -308,17 +314,17 @@ fn command_targets_outside_workspace(command: &str) -> bool {
         "/etc/", "/usr/", "/var/", "/boot/", "/sys/", "/proc/", "/dev/", "/sbin/", "/lib/", "/opt/",
     ];
 
-    let first = extract_first_command(command);
-    let is_write_cmd = WRITE_COMMANDS.contains(&first.as_str())
-        || STATE_MODIFYING_COMMANDS.contains(&first.as_str());
-
-    if !is_write_cmd {
-        return false;
-    }
-
-    for sys_path in &system_paths {
-        if command.contains(sys_path) {
-            return true;
+    for segment in split_command_chain(command) {
+        let first = extract_first_command(segment);
+        let is_write_cmd = WRITE_COMMANDS.contains(&first.as_str())
+            || STATE_MODIFYING_COMMANDS.contains(&first.as_str());
+        if !is_write_cmd {
+            continue;
+        }
+        for sys_path in &system_paths {
+            if segment.contains(sys_path) {
+                return true;
+            }
         }
     }
 
@@ -334,16 +340,17 @@ fn command_targets_outside_workspace(command: &str) -> bool {
 /// Corresponds to upstream `tools/BashTool/sedValidation.ts`.
 #[must_use]
 pub fn validate_sed(command: &str, mode: PermissionMode) -> ValidationResult {
-    let first = extract_first_command(command);
-    if first != "sed" {
+    if mode != PermissionMode::ReadOnly {
+        // Still return Allow when not read-only; in-place is only restricted there.
         return ValidationResult::Allow;
     }
 
-    // In read-only mode, block sed -i (in-place editing).
-    if mode == PermissionMode::ReadOnly && command.contains(" -i") {
-        return ValidationResult::Block {
-            reason: "sed -i (in-place editing) is not allowed in read-only mode".to_string(),
-        };
+    for segment in split_command_chain(command) {
+        if segment_uses_sed_inplace(segment) {
+            return ValidationResult::Block {
+                reason: "sed -i (in-place editing) is not allowed in read-only mode".to_string(),
+            };
+        }
     }
 
     ValidationResult::Allow
@@ -704,6 +711,201 @@ fn find_end_of_value(s: &str) -> Option<usize> {
     }
 }
 
+/// Split a bash command string into individual command segments along
+/// top-level separators: `;`, `|`, `||`, `&&`, `&`.
+///
+/// Honors single quotes, double quotes (with backslash escapes), backticks,
+/// `$(...)` subshells, and `${...}` parameter expansions so separators inside
+/// those are ignored. Also skips `>&` / `&>` redirection operators so they do
+/// not split as background `&`.
+#[must_use]
+pub fn split_command_chain(command: &str) -> Vec<&str> {
+    let bytes = command.as_bytes();
+    let mut out = Vec::new();
+    let mut seg_start = 0usize;
+    let mut i = 0usize;
+
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut depth_paren = 0i32; // $(...)
+    let mut depth_brace = 0i32; // ${...}
+    let mut depth_backtick = 0i32;
+
+    while i < bytes.len() {
+        let b = bytes[i];
+
+        // Inside single-quoted string: nothing escapes except the closing quote.
+        if in_single {
+            if b == b'\'' {
+                in_single = false;
+            }
+            i += 1;
+            continue;
+        }
+
+        // Inside double-quoted string: backslash escapes next char.
+        if in_double {
+            if b == b'\\' && i + 1 < bytes.len() {
+                i += 2;
+                continue;
+            }
+            if b == b'"' {
+                in_double = false;
+                i += 1;
+                continue;
+            }
+            // $( still opens a subshell inside double quotes
+            if b == b'$' && i + 1 < bytes.len() && bytes[i + 1] == b'(' {
+                depth_paren += 1;
+                i += 2;
+                continue;
+            }
+            if b == b'$' && i + 1 < bytes.len() && bytes[i + 1] == b'{' {
+                depth_brace += 1;
+                i += 2;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+
+        if depth_backtick > 0 {
+            if b == b'`' {
+                depth_backtick -= 1;
+            }
+            i += 1;
+            continue;
+        }
+
+        if b == b'\\' && i + 1 < bytes.len() {
+            i += 2;
+            continue;
+        }
+        if b == b'\'' {
+            in_single = true;
+            i += 1;
+            continue;
+        }
+        if b == b'"' {
+            in_double = true;
+            i += 1;
+            continue;
+        }
+        if b == b'`' {
+            depth_backtick += 1;
+            i += 1;
+            continue;
+        }
+        if b == b'$' && i + 1 < bytes.len() && bytes[i + 1] == b'(' {
+            depth_paren += 1;
+            i += 2;
+            continue;
+        }
+        if b == b'$' && i + 1 < bytes.len() && bytes[i + 1] == b'{' {
+            depth_brace += 1;
+            i += 2;
+            continue;
+        }
+        if b == b')' && depth_paren > 0 {
+            depth_paren -= 1;
+            i += 1;
+            continue;
+        }
+        if b == b'}' && depth_brace > 0 {
+            depth_brace -= 1;
+            i += 1;
+            continue;
+        }
+
+        if depth_paren > 0 || depth_brace > 0 {
+            i += 1;
+            continue;
+        }
+
+        // Skip redirection operators that contain `&`: `>&`, `&>`, `1>&2`, etc.
+        // Treat `N>&M` as a single token so we do not split on the `&`.
+        if b == b'&' && i + 1 < bytes.len() && bytes[i + 1] == b'>' {
+            i += 2;
+            continue;
+        }
+        if b == b'>' && i + 1 < bytes.len() && bytes[i + 1] == b'&' {
+            i += 2;
+            continue;
+        }
+
+        // Separator detection.
+        let sep_len = match b {
+            b';' => 1,
+            b'|' => {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'|' {
+                    2
+                } else {
+                    1
+                }
+            }
+            b'&' => {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'&' {
+                    2
+                } else {
+                    1
+                }
+            }
+            _ => 0,
+        };
+
+        if sep_len > 0 {
+            let seg = command[seg_start..i].trim();
+            if !seg.is_empty() {
+                out.push(seg);
+            }
+            i += sep_len;
+            seg_start = i;
+            continue;
+        }
+
+        i += 1;
+    }
+
+    let tail = command[seg_start..].trim();
+    if !tail.is_empty() {
+        out.push(tail);
+    }
+    out
+}
+
+/// Detect sed in-place editing flags in a single command segment.
+fn segment_uses_sed_inplace(segment: &str) -> bool {
+    let mut tokens = segment.split_whitespace();
+    let first = match tokens.next() {
+        Some(t) => t,
+        None => return false,
+    };
+    if first != "sed" {
+        return false;
+    }
+    for tok in tokens {
+        if tok == "-i" || tok == "--in-place" {
+            return true;
+        }
+        if let Some(rest) = tok.strip_prefix("--in-place=") {
+            let _ = rest;
+            return true;
+        }
+        if let Some(rest) = tok.strip_prefix("-i") {
+            // -i<suffix>  (BSD sed style)
+            let _ = rest;
+            return true;
+        }
+        if let Some(rest) = tok.strip_prefix('-') {
+            // Bundled short flags like -Ei, -nEi
+            if !rest.starts_with('-') && rest.contains('i') {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1000,5 +1202,106 @@ mod tests {
     #[test]
     fn extracts_plain_command() {
         assert_eq!(extract_first_command("grep -r pattern ."), "grep");
+    }
+
+    // --- split_command_chain ---
+
+    #[test]
+    fn splits_pipeline_and_chains() {
+        assert_eq!(
+            split_command_chain("cat foo | grep bar"),
+            vec!["cat foo", "grep bar"]
+        );
+        assert_eq!(
+            split_command_chain("a ; b && c || d & e"),
+            vec!["a", "b", "c", "d", "e"]
+        );
+    }
+
+    #[test]
+    fn split_respects_quoting() {
+        // `;` inside quotes must not split.
+        assert_eq!(
+            split_command_chain("echo 'a;b' ; rm -rf /tmp/x"),
+            vec!["echo 'a;b'", "rm -rf /tmp/x"]
+        );
+        assert_eq!(
+            split_command_chain("echo \"a|b\" | wc"),
+            vec!["echo \"a|b\"", "wc"]
+        );
+    }
+
+    #[test]
+    fn split_respects_subshells_and_backticks() {
+        assert_eq!(
+            split_command_chain("echo $(date ; whoami) && ls"),
+            vec!["echo $(date ; whoami)", "ls"]
+        );
+        assert_eq!(
+            split_command_chain("echo `date ; whoami` && ls"),
+            vec!["echo `date ; whoami`", "ls"]
+        );
+    }
+
+    #[test]
+    fn split_ignores_redirection_ampersands() {
+        assert_eq!(
+            split_command_chain("cmd 2>&1 | grep foo"),
+            vec!["cmd 2>&1", "grep foo"]
+        );
+        assert_eq!(
+            split_command_chain("cmd &> log && ls"),
+            vec!["cmd &> log", "ls"]
+        );
+    }
+
+    #[test]
+    fn read_only_rejects_trailing_write_segment() {
+        assert!(matches!(
+            validate_read_only("cat foo ; rm -rf /tmp/x", PermissionMode::ReadOnly),
+            ValidationResult::Block { .. }
+        ));
+        assert!(matches!(
+            validate_read_only("ls | tee out.log", PermissionMode::ReadOnly),
+            ValidationResult::Block { .. }
+        ));
+    }
+
+    #[test]
+    fn destructive_catches_chained_rm() {
+        assert!(matches!(
+            check_destructive("echo start ; rm -rf /tmp/x"),
+            ValidationResult::Warn { .. }
+        ));
+    }
+
+    #[test]
+    fn workspace_write_catches_chained_system_write() {
+        assert!(matches!(
+            validate_mode(
+                "echo hi ; cp x /etc/config",
+                PermissionMode::WorkspaceWrite
+            ),
+            ValidationResult::Warn { .. }
+        ));
+    }
+
+    #[test]
+    fn sed_inplace_detection_variants() {
+        assert!(segment_uses_sed_inplace("sed -i s/a/b/ f"));
+        assert!(segment_uses_sed_inplace("sed -i.bak s/a/b/ f"));
+        assert!(segment_uses_sed_inplace("sed --in-place s/a/b/ f"));
+        assert!(segment_uses_sed_inplace("sed --in-place=.bak s/a/b/ f"));
+        assert!(segment_uses_sed_inplace("sed -Ei s/a/b/ f"));
+        assert!(!segment_uses_sed_inplace("sed s/a/b/ f"));
+        assert!(!segment_uses_sed_inplace("sed -n 5p f"));
+    }
+
+    #[test]
+    fn sed_inplace_detected_in_chain() {
+        assert!(matches!(
+            validate_sed("cat x ; sed -i s/a/b/ f", PermissionMode::ReadOnly),
+            ValidationResult::Block { .. }
+        ));
     }
 }
