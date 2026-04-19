@@ -283,6 +283,40 @@ impl OpenAiCompatClient {
 /// the system clock resolution is coarser than consecutive retry sleeps.
 static JITTER_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// Maximum bytes for a tool_use input serialized to JSON before truncation.
+/// Prevents large bash heredocs (e.g. embedded YAML configs) from filling the
+/// 32k-token context window of local Ollama models.
+const MAX_TOOL_INPUT_BYTES: usize = 4_096;
+
+/// Serialize tool_use input, truncating large commands to preserve context budget.
+/// For Bash tools, truncates the `command` field while keeping the JSON valid.
+/// For other tools, truncates the serialized string with a marker suffix.
+fn truncate_tool_input(name: &str, input: &Value) -> String {
+    let serialized = input.to_string();
+    if serialized.len() <= MAX_TOOL_INPUT_BYTES {
+        return serialized;
+    }
+    if name == "Bash" || name == "bash" {
+        if let Some(obj) = input.as_object() {
+            if let Some(Value::String(cmd)) = obj.get("command") {
+                if cmd.len() > MAX_TOOL_INPUT_BYTES {
+                    let mut truncated_obj = obj.clone();
+                    let mut short_cmd = cmd[..MAX_TOOL_INPUT_BYTES].to_string();
+                    short_cmd.push_str("...[command truncated]");
+                    truncated_obj.insert(
+                        "command".to_string(),
+                        Value::String(short_cmd),
+                    );
+                    return Value::Object(truncated_obj).to_string();
+                }
+            }
+        }
+    }
+    let mut s = serialized[..MAX_TOOL_INPUT_BYTES].to_string();
+    s.push_str("...[input truncated]");
+    s
+}
+
 /// Returns a random additive jitter in `[0, base]` to decorrelate retries
 /// Deserialize a JSON field as a `Vec<T>`, treating an explicit `null` value
 /// the same as a missing field (i.e. as an empty vector).
@@ -909,7 +943,7 @@ pub fn translate_message(message: &InputMessage, model: &str) -> Vec<Value> {
                         "type": "function",
                         "function": {
                             "name": name,
-                            "arguments": input.to_string(),
+                            "arguments": truncate_tool_input(name, input),
                         }
                     })),
                     InputContentBlock::ToolResult { .. } => {}
@@ -1347,8 +1381,8 @@ impl StringExt for String {
 mod tests {
     use super::{
         build_chat_completion_request, chat_completions_endpoint, is_reasoning_model,
-        normalize_finish_reason, openai_tool_choice, parse_tool_arguments, OpenAiCompatClient,
-        OpenAiCompatConfig,
+        normalize_finish_reason, openai_tool_choice, parse_tool_arguments, truncate_tool_input,
+        OpenAiCompatClient, OpenAiCompatConfig, MAX_TOOL_INPUT_BYTES,
     };
     use crate::error::ApiError;
     use crate::types::{
@@ -2044,5 +2078,36 @@ mod tests {
         assert_eq!(tool_msg_kimi["tool_call_id"], json!("call_1"));
         assert_eq!(tool_msg_gpt["content"], json!("file contents"));
         assert_eq!(tool_msg_kimi["content"], json!("file contents"));
+    }
+
+    #[test]
+    fn short_tool_input_passes_through_unchanged() {
+        let input = json!({"command": "ls -la"});
+        let result = truncate_tool_input("Bash", &input);
+        assert_eq!(result, input.to_string());
+    }
+
+    #[test]
+    fn large_bash_command_truncates_command_field_keeping_valid_json() {
+        let long_cmd = "x".repeat(MAX_TOOL_INPUT_BYTES + 1000);
+        let input = json!({"command": long_cmd, "description": "test"});
+        let result = truncate_tool_input("Bash", &input);
+        // Must be valid JSON
+        let parsed: serde_json::Value =
+            serde_json::from_str(&result).expect("truncated bash input must be valid JSON");
+        let cmd = parsed["command"].as_str().unwrap();
+        assert!(cmd.ends_with("...[command truncated]"));
+        assert!(cmd.len() <= MAX_TOOL_INPUT_BYTES + 30);
+        // Other fields preserved
+        assert_eq!(parsed["description"], json!("test"));
+    }
+
+    #[test]
+    fn large_non_bash_tool_input_truncates_as_string() {
+        let large_val = "y".repeat(MAX_TOOL_INPUT_BYTES + 500);
+        let input = json!({"path": large_val});
+        let result = truncate_tool_input("Read", &input);
+        assert!(result.ends_with("...[input truncated]"));
+        assert!(result.len() <= MAX_TOOL_INPUT_BYTES + 25);
     }
 }
