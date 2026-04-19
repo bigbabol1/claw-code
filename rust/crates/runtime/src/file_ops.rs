@@ -50,6 +50,23 @@ const MAX_READ_SIZE: u64 = 10 * 1024 * 1024;
 /// Maximum file size that can be written (10 MB).
 const MAX_WRITE_SIZE: usize = 10 * 1024 * 1024;
 
+/// Maximum bytes to echo back in tool result content fields.
+/// Prevents large file writes from bloating the conversation context window
+/// of local Ollama models with limited token budgets (e.g. 32k ctx).
+const MAX_RESULT_ECHO_BYTES: usize = 512;
+
+/// Truncate a string echoed in a tool result to keep context usage bounded.
+fn truncate_result_echo(s: &str, total_bytes: usize) -> String {
+    if s.len() <= MAX_RESULT_ECHO_BYTES {
+        return s.to_owned();
+    }
+    format!(
+        "{}\n\n[{} bytes total — truncated in result to save context]",
+        &s[..MAX_RESULT_ECHO_BYTES],
+        total_bytes
+    )
+}
+
 /// Check whether a file appears to contain binary content by examining
 /// the first chunk for NUL bytes.
 fn is_binary_file(path: &Path) -> io::Result<bool> {
@@ -275,6 +292,7 @@ pub fn write_file(path: &str, content: &str) -> io::Result<WriteFileOutput> {
     }
     fs::write(&absolute_path, content)?;
 
+    let total_bytes = content.len();
     Ok(WriteFileOutput {
         kind: if original_file.is_some() {
             String::from("update")
@@ -282,9 +300,9 @@ pub fn write_file(path: &str, content: &str) -> io::Result<WriteFileOutput> {
             String::from("create")
         },
         file_path: absolute_path.to_string_lossy().into_owned(),
-        content: content.to_owned(),
+        content: truncate_result_echo(content, total_bytes),
         structured_patch: make_patch(original_file.as_deref().unwrap_or(""), content),
-        original_file,
+        original_file: None,
         git_diff: None,
     })
 }
@@ -318,11 +336,13 @@ pub fn edit_file(
     };
     fs::write(&absolute_path, &updated)?;
 
+    let old_len = old_string.len();
+    let new_len = new_string.len();
     Ok(EditFileOutput {
         file_path: absolute_path.to_string_lossy().into_owned(),
-        old_string: old_string.to_owned(),
-        new_string: new_string.to_owned(),
-        original_file: original_file.clone(),
+        old_string: truncate_result_echo(old_string, old_len),
+        new_string: truncate_result_echo(new_string, new_len),
+        original_file: String::new(),
         structured_patch: make_patch(&original_file, &updated),
         user_modified: false,
         replace_all,
@@ -693,11 +713,17 @@ fn apply_limit<T>(
     )
 }
 
+/// Maximum total diff lines in the returned patch before we drop it entirely.
+/// A full-file replacement can produce O(old+new) lines; at 32k-token context
+/// budgets that saturates the window before the model can respond.
+const MAX_PATCH_LINES: usize = 200;
+
 fn make_patch(original: &str, updated: &str) -> Vec<StructuredPatchHunk> {
     use similar::{ChangeTag, TextDiff};
 
     let diff = TextDiff::from_lines(original, updated);
     let mut hunks = Vec::new();
+    let mut total_lines = 0usize;
 
     for group in diff.grouped_ops(3) {
         let old_start = group
@@ -728,6 +754,7 @@ fn make_patch(original: &str, updated: &str) -> Vec<StructuredPatchHunk> {
             }
         }
 
+        total_lines += lines.len();
         hunks.push(StructuredPatchHunk {
             old_start,
             old_lines,
@@ -735,6 +762,13 @@ fn make_patch(original: &str, updated: &str) -> Vec<StructuredPatchHunk> {
             new_lines,
             lines,
         });
+
+        // Drop patch entirely if it exceeds the line budget — a full-file
+        // replacement produces O(old+new) lines and would saturate the
+        // 32k-token context window before the model can respond.
+        if total_lines > MAX_PATCH_LINES {
+            return Vec::new();
+        }
     }
 
     hunks
