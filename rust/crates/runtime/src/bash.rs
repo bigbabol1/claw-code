@@ -285,8 +285,8 @@ mod tests {
     }
 }
 
-/// Maximum output bytes before truncation (16 KiB, matching upstream).
-const MAX_OUTPUT_BYTES: usize = 16_384;
+/// Maximum output bytes before truncation (2 KiB — sized for local 32k-context models).
+const MAX_OUTPUT_BYTES: usize = 2_048;
 
 /// Truncate output to `MAX_OUTPUT_BYTES`, appending a marker when trimmed.
 fn truncate_output(s: &str) -> String {
@@ -299,7 +299,7 @@ fn truncate_output(s: &str) -> String {
         end -= 1;
     }
     let mut truncated = s[..end].to_string();
-    truncated.push_str("\n\n[output truncated — exceeded 16384 bytes]");
+    truncated.push_str("\n\n[output truncated — exceeded 2048 bytes]");
     truncated
 }
 
@@ -318,7 +318,7 @@ mod truncation_tests {
         let s = "x".repeat(20_000);
         let result = truncate_output(&s);
         assert!(result.len() < 20_000);
-        assert!(result.ends_with("[output truncated — exceeded 16384 bytes]"));
+        assert!(result.ends_with("[output truncated — exceeded 2048 bytes]"));
     }
 
     #[test]
