@@ -109,8 +109,156 @@ type RuntimePluginStateBuildOutput = (
     Vec<RuntimeToolDefinition>,
 );
 
+/// Error type that propagates a specific process exit code up to `main` without
+/// losing the message or causing double-printing. Emitted by paths that
+/// historically called `std::process::exit` mid-flow.
+#[derive(Debug)]
+struct CliExit {
+    code: i32,
+    /// If true, the caller already printed the diagnostic to stderr and `main`
+    /// must not re-emit it.
+    already_reported: bool,
+    message: String,
+}
+
+impl std::fmt::Display for CliExit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for CliExit {}
+
+// ---------------------------------------------------------------------------
+// Tool Learning Store — tracks success/failure of tool calls across sessions.
+// All I/O is best-effort; errors are silently discarded so nothing here can
+// crash the CLI.
+// ---------------------------------------------------------------------------
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ToolOutcome {
+    tool_name: String,
+    is_error: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_msg: Option<String>,
+    timestamp_ms: u64,
+}
+
+struct ToolLearningStore {
+    path: PathBuf,
+}
+
+impl ToolLearningStore {
+    const MAX_LOG_LINES: usize = 200;
+    const MAX_HINT_TOOLS: usize = 5;
+    const MAX_ERROR_CHARS: usize = 120;
+
+    fn new() -> Self {
+        let base = env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."));
+        Self {
+            path: base.join(".local/share/claw/tool_outcomes.jsonl"),
+        }
+    }
+
+    fn record(&self, tool_name: &str, is_error: bool, output: &str) {
+        let error_msg = if is_error {
+            Some(output.chars().take(Self::MAX_ERROR_CHARS).collect::<String>())
+        } else {
+            None
+        };
+        let outcome = ToolOutcome {
+            tool_name: tool_name.to_string(),
+            is_error,
+            error_msg,
+            timestamp_ms: std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+        };
+        let Ok(new_line) = serde_json::to_string(&outcome) else {
+            return;
+        };
+        if let Some(parent) = self.path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let existing: Vec<String> = fs::read_to_string(&self.path)
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(str::to_owned)
+            .collect();
+        let keep_from = existing.len().saturating_sub(Self::MAX_LOG_LINES - 1);
+        let mut content = existing[keep_from..].join("\n");
+        if !content.is_empty() {
+            content.push('\n');
+        }
+        content.push_str(&new_line);
+        content.push('\n');
+        let _ = fs::write(&self.path, content);
+    }
+
+    /// Returns a compact system-prompt section (at most MAX_HINT_TOOLS lines)
+    /// listing tools with persistent failures, or `None` if the log is clean.
+    fn system_prompt_hint(&self) -> Option<String> {
+        use std::io::BufRead;
+        let file = fs::File::open(&self.path).ok()?;
+        let reader = std::io::BufReader::new(file);
+
+        let mut counts: std::collections::HashMap<String, (u32, u32, String)> =
+            std::collections::HashMap::new();
+        for line in reader.lines().map_while(Result::ok) {
+            if let Ok(o) = serde_json::from_str::<ToolOutcome>(&line) {
+                let entry = counts.entry(o.tool_name).or_insert((0, 0, String::new()));
+                entry.1 += 1;
+                if o.is_error {
+                    entry.0 += 1;
+                    if let Some(msg) = o.error_msg {
+                        if entry.2.is_empty() {
+                            entry.2 = msg;
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut warnings: Vec<(u32, String)> = counts
+            .into_iter()
+            .filter(|(_, (failures, total, _))| *failures >= 2 && *failures * 2 >= *total)
+            .map(|(name, (failures, _, msg))| {
+                let line = if msg.is_empty() {
+                    format!("- `{name}` failed {failures}x")
+                } else {
+                    format!("- `{name}` failed {failures}x: {msg}")
+                };
+                (failures, line)
+            })
+            .collect();
+
+        if warnings.is_empty() {
+            return None;
+        }
+
+        warnings.sort_by(|a, b| b.0.cmp(&a.0));
+        warnings.truncate(Self::MAX_HINT_TOOLS);
+        let lines: Vec<String> = warnings.into_iter().map(|(_, l)| l).collect();
+
+        Some(format!(
+            "## Tool failures (recent)\n{}\n",
+            lines.join("\n")
+        ))
+    }
+}
+
 fn main() {
     if let Err(error) = run() {
+        if let Some(exit) = error.downcast_ref::<CliExit>() {
+            if !exit.already_reported && !exit.message.is_empty() {
+                eprintln!("{}", exit.message);
+            }
+            std::process::exit(exit.code);
+        }
         let message = error.to_string();
         // When --output-format json is active, emit errors as JSON so downstream
         // tools can parse failures the same way they parse successes (ROADMAP #42).
@@ -214,7 +362,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             session_path,
             commands,
             output_format,
-        } => resume_session(&session_path, &commands, output_format),
+        } => resume_session(&session_path, &commands, output_format)?,
         CliAction::Status {
             model,
             permission_mode,
@@ -2162,7 +2310,11 @@ fn version_json_value() -> serde_json::Value {
 }
 
 #[allow(clippy::too_many_lines)]
-fn resume_session(session_path: &Path, commands: &[String], output_format: CliOutputFormat) {
+fn resume_session(
+    session_path: &Path,
+    commands: &[String],
+    output_format: CliOutputFormat,
+) -> Result<(), Box<dyn std::error::Error>> {
     let session_reference = session_path.display().to_string();
     let (handle, session) = match load_session_reference(&session_reference) {
         Ok(loaded) => loaded,
@@ -2178,7 +2330,11 @@ fn resume_session(session_path: &Path, commands: &[String], output_format: CliOu
             } else {
                 eprintln!("failed to restore session: {error}");
             }
-            std::process::exit(1);
+            return Err(Box::new(CliExit {
+                code: 1,
+                already_reported: true,
+                message: format!("failed to restore session: {error}"),
+            }));
         }
     };
     let resolved_path = handle.path.clone();
@@ -2201,7 +2357,7 @@ fn resume_session(session_path: &Path, commands: &[String], output_format: CliOu
                 session.messages.len()
             );
         }
-        return;
+        return Ok(());
     }
 
     let mut session = session;
@@ -2230,7 +2386,11 @@ fn resume_session(session_path: &Path, commands: &[String], output_format: CliOu
                 } else {
                     eprintln!("/{cmd_root} is not yet implemented in this build");
                 }
-                std::process::exit(2);
+                return Err(Box::new(CliExit {
+                    code: 2,
+                    already_reported: true,
+                    message: format!("/{cmd_root} is not yet implemented in this build"),
+                }));
             }
         }
         let command = match SlashCommand::parse(raw_command) {
@@ -2248,7 +2408,11 @@ fn resume_session(session_path: &Path, commands: &[String], output_format: CliOu
                 } else {
                     eprintln!("unsupported resumed command: {raw_command}");
                 }
-                std::process::exit(2);
+                return Err(Box::new(CliExit {
+                    code: 2,
+                    already_reported: true,
+                    message: format!("unsupported resumed command: {raw_command}"),
+                }));
             }
             Err(error) => {
                 if output_format == CliOutputFormat::Json {
@@ -2263,7 +2427,11 @@ fn resume_session(session_path: &Path, commands: &[String], output_format: CliOu
                 } else {
                     eprintln!("{error}");
                 }
-                std::process::exit(2);
+                return Err(Box::new(CliExit {
+                    code: 2,
+                    already_reported: true,
+                    message: error.to_string(),
+                }));
             }
         };
         match run_resume_command(&resolved_path, &session, &command) {
@@ -2300,10 +2468,15 @@ fn resume_session(session_path: &Path, commands: &[String], output_format: CliOu
                 } else {
                     eprintln!("{error}");
                 }
-                std::process::exit(2);
+                return Err(Box::new(CliExit {
+                    code: 2,
+                    already_reported: true,
+                    message: error.to_string(),
+                }));
             }
         }
     }
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -3025,7 +3198,11 @@ fn enforce_broad_cwd_policy(
         let trimmed = input.trim().to_lowercase();
         if trimmed != "y" && trimmed != "yes" {
             eprintln!("Aborted.");
-            std::process::exit(0);
+            return Err(Box::new(CliExit {
+                code: 0,
+                already_reported: true,
+                message: String::new(),
+            }));
         }
         Ok(())
     } else {
@@ -3051,7 +3228,11 @@ fn enforce_broad_cwd_policy(
                 eprintln!("error: {message}");
             }
         }
-        std::process::exit(1);
+        Err(Box::new(CliExit {
+            code: 1,
+            already_reported: true,
+            message,
+        }))
     }
 }
 
@@ -3776,6 +3957,20 @@ impl LiveCli {
         hook_abort_monitor.stop();
         match result {
             Ok(summary) => {
+                let learning_store = ToolLearningStore::new();
+                for msg in &summary.tool_results {
+                    for block in &msg.blocks {
+                        if let ContentBlock::ToolResult {
+                            tool_name,
+                            is_error,
+                            output,
+                            ..
+                        } = block
+                        {
+                            learning_store.record(tool_name, *is_error, output);
+                        }
+                    }
+                }
                 self.replace_runtime(runtime)?;
                 spinner.finish(
                     "✨ Done",
@@ -6171,12 +6366,16 @@ fn short_tool_id(id: &str) -> String {
 }
 
 fn build_system_prompt() -> Result<Vec<String>, Box<dyn std::error::Error>> {
-    Ok(load_system_prompt(
+    let mut sections = load_system_prompt(
         env::current_dir()?,
         DEFAULT_DATE,
         env::consts::OS,
         "unknown",
-    )?)
+    )?;
+    if let Some(hint) = ToolLearningStore::new().system_prompt_hint() {
+        sections.push(hint);
+    }
+    Ok(sections)
 }
 
 fn build_runtime_plugin_state() -> Result<RuntimePluginState, Box<dyn std::error::Error>> {
