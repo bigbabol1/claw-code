@@ -5,9 +5,37 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use glob::Pattern;
+use globset::{Glob, GlobSet, GlobSetBuilder};
+use ignore::WalkBuilder;
 use regex::RegexBuilder;
 use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
+
+/// Hard wall-clock timeout for `glob_search` (seconds).
+const GLOB_TIMEOUT_SECS: u64 = 5;
+/// Max directory entries visited before bailing out.
+const GLOB_MAX_VISITED: usize = 50_000;
+/// Max recursion depth for `glob_search`.
+const GLOB_MAX_DEPTH: usize = 20;
+/// Max results returned (mirrors prior behavior).
+const GLOB_MAX_RESULTS: usize = 100;
+/// Directories always pruned when the base is `$HOME` or `/`.
+const GLOB_SKIP_DIRS: &[&str] = &[
+    ".cache",
+    ".local/share",
+    ".local/state",
+    ".npm",
+    ".cargo/registry",
+    ".rustup",
+    ".gradle",
+    ".m2",
+    ".Trash",
+    "node_modules",
+    "target",
+    "dist",
+    ".venv",
+    "__pycache__",
+];
 
 /// Maximum file size that can be read (10 MB).
 const MAX_READ_SIZE: u64 = 10 * 1024 * 1024;
@@ -295,49 +323,134 @@ pub fn edit_file(
     })
 }
 
+/// Returns `true` if `dir` is the filesystem root or the user's `$HOME`.
+fn is_dangerous_base(dir: &Path) -> bool {
+    if dir == Path::new("/") {
+        return true;
+    }
+    match std::env::var_os("HOME") {
+        Some(home) => dir == Path::new(&home),
+        None => false,
+    }
+}
+
+/// Build a `GlobSet` from brace-expanded patterns.
+fn build_globset(patterns: &[String]) -> io::Result<GlobSet> {
+    let mut builder = GlobSetBuilder::new();
+    for pat in patterns {
+        let glob = Glob::new(pat).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid glob pattern `{pat}`: {e}"),
+            )
+        })?;
+        builder.add(glob);
+    }
+    builder.build().map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("globset build error: {e}"),
+        )
+    })
+}
+
 /// Expands a glob pattern and returns matching filenames.
+///
+/// Uses `ignore::WalkBuilder` to honor `.gitignore` and avoid symlink loops.
+/// Enforces hard caps on wall-clock time, visited entries, recursion depth,
+/// and result count so a broad pattern (e.g. `**/*.yaml` from `$HOME`) can
+/// no longer hang the process. Does not follow symlinks.
 pub fn glob_search(pattern: &str, path: Option<&str>) -> io::Result<GlobSearchOutput> {
     let started = Instant::now();
+    let deadline = started + std::time::Duration::from_secs(GLOB_TIMEOUT_SECS);
+
     let base_dir = path
         .map(normalize_path)
         .transpose()?
         .unwrap_or(std::env::current_dir()?);
-    let search_pattern = if Path::new(pattern).is_absolute() {
-        pattern.to_owned()
+
+    let expanded = expand_braces(pattern);
+    let full_patterns: Vec<String> = expanded
+        .iter()
+        .map(|p| {
+            if Path::new(p).is_absolute() {
+                p.clone()
+            } else {
+                base_dir.join(p).to_string_lossy().into_owned()
+            }
+        })
+        .collect();
+    let globset = build_globset(&full_patterns)?;
+
+    let dangerous = is_dangerous_base(&base_dir);
+    let skip_prefixes: Vec<PathBuf> = if dangerous {
+        GLOB_SKIP_DIRS.iter().map(|d| base_dir.join(d)).collect()
     } else {
-        base_dir.join(pattern).to_string_lossy().into_owned()
+        Vec::new()
     };
 
-    // The `glob` crate does not support brace expansion ({a,b,c}).
-    // Expand braces into multiple patterns so patterns like
-    // `Assets/**/*.{cs,uxml,uss}` work correctly.
-    let expanded = expand_braces(&search_pattern);
+    let mut builder = WalkBuilder::new(&base_dir);
+    builder
+        .max_depth(Some(GLOB_MAX_DEPTH))
+        .follow_links(false)
+        .hidden(false)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .ignore(true)
+        .parents(true);
+    if !skip_prefixes.is_empty() {
+        let prefixes = skip_prefixes.clone();
+        builder.filter_entry(move |entry| {
+            let p = entry.path();
+            !prefixes.iter().any(|skip| p.starts_with(skip))
+        });
+    }
 
-    let mut seen = std::collections::HashSet::new();
-    let mut matches = Vec::new();
-    for pat in &expanded {
-        let entries = glob::glob(pat)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
-        for entry in entries.flatten() {
-            if entry.is_file() && seen.insert(entry.clone()) {
-                matches.push(entry);
+    let mut matches: Vec<(PathBuf, Option<std::time::SystemTime>)> = Vec::new();
+    let mut visited: usize = 0;
+
+    for entry_result in builder.build() {
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "glob_search: wall-clock timeout ({GLOB_TIMEOUT_SECS}s) exceeded after {visited} entries"
+                ),
+            ));
+        }
+        visited += 1;
+        if visited > GLOB_MAX_VISITED {
+            return Err(io::Error::other(format!(
+                "glob_search: visited-entry cap ({GLOB_MAX_VISITED}) exceeded"
+            )));
+        }
+
+        let Ok(entry) = entry_result else { continue };
+
+        match entry.file_type() {
+            Some(ft) if ft.is_file() => {}
+            _ => continue,
+        }
+
+        let entry_path = entry.path();
+        if globset.is_match(entry_path) {
+            let mtime = entry.metadata().ok().and_then(|m| m.modified().ok());
+            matches.push((entry_path.to_path_buf(), mtime));
+            if matches.len() >= GLOB_MAX_RESULTS.saturating_mul(10) {
+                break;
             }
         }
     }
 
-    matches.sort_by_key(|path| {
-        fs::metadata(path)
-            .and_then(|metadata| metadata.modified())
-            .ok()
-            .map(Reverse)
-    });
+    matches.sort_by_key(|(_, mtime)| mtime.map(Reverse));
 
-    let truncated = matches.len() > 100;
-    let filenames = matches
+    let truncated = matches.len() > GLOB_MAX_RESULTS;
+    let filenames: Vec<String> = matches
         .into_iter()
-        .take(100)
-        .map(|path| path.to_string_lossy().into_owned())
-        .collect::<Vec<_>>();
+        .take(GLOB_MAX_RESULTS)
+        .map(|(p, _)| p.to_string_lossy().into_owned())
+        .collect();
 
     Ok(GlobSearchOutput {
         duration_ms: started.elapsed().as_millis(),
@@ -835,5 +948,91 @@ mod tests {
             "should match .rs and .toml but not .txt"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod glob_hardening_tests {
+    use super::*;
+
+    #[test]
+    fn glob_search_home_broad_completes_within_caps() {
+        let home = std::env::var("HOME").unwrap();
+        let t0 = Instant::now();
+        let res = glob_search("**/mic*.y*ml*", Some(&home));
+        let elapsed = t0.elapsed();
+        assert!(
+            elapsed.as_secs() < GLOB_TIMEOUT_SECS + 3,
+            "reproducer took {elapsed:?}, expected < {}s",
+            GLOB_TIMEOUT_SECS + 3
+        );
+        match res {
+            Ok(o) => assert!(o.num_files <= GLOB_MAX_RESULTS),
+            Err(e) => assert!(matches!(
+                e.kind(),
+                io::ErrorKind::TimedOut | io::ErrorKind::Other
+            )),
+        }
+    }
+
+    #[test]
+    fn glob_search_symlink_cycle_does_not_hang() {
+        let base = std::env::temp_dir().join(format!(
+            "glob-cycle-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let a = base.join("a");
+        let b = a.join("b");
+        fs::create_dir_all(&b).unwrap();
+        fs::write(a.join("real.txt"), "x").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&a, b.join("loop")).unwrap();
+
+        let t0 = Instant::now();
+        let res = glob_search("**/*.txt", Some(base.to_str().unwrap()));
+        assert!(t0.elapsed().as_secs() < GLOB_TIMEOUT_SECS + 2);
+        let out = res.expect("should not error on cycle with follow_links=false");
+        assert!(out.filenames.iter().any(|f| f.ends_with("real.txt")));
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn glob_search_depth_cap_excludes_deep_files() {
+        let base = std::env::temp_dir().join(format!(
+            "glob-depth-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&base).unwrap();
+        let shallow = base.join("a/b/c");
+        fs::create_dir_all(&shallow).unwrap();
+        fs::write(shallow.join("shallow.yml"), "x").unwrap();
+
+        let mut deep = base.clone();
+        for i in 0..(GLOB_MAX_DEPTH + 5) {
+            deep = deep.join(format!("d{i}"));
+        }
+        fs::create_dir_all(&deep).unwrap();
+        fs::write(deep.join("deep.yml"), "x").unwrap();
+
+        let out = glob_search("**/*.yml", Some(base.to_str().unwrap())).unwrap();
+        let names: Vec<String> = out
+            .filenames
+            .iter()
+            .map(|f| f.rsplit('/').next().unwrap().to_string())
+            .collect();
+        assert!(names.contains(&"shallow.yml".to_string()));
+        assert!(
+            !names.contains(&"deep.yml".to_string()),
+            "deep file should be excluded by depth cap; got {names:?}"
+        );
+
+        let _ = fs::remove_dir_all(&base);
     }
 }
