@@ -301,10 +301,16 @@ where
             return Ok(());
         }
 
-        // Verify tool executor is responsive with a non-destructive probe
-        // Using glob_search with a pattern that won't match anything
-        let probe_input = r#"{"pattern": "*.health-check-probe-"}"#;
-        match self.tool_executor.execute("glob_search", probe_input) {
+        // Verify tool executor is responsive with a non-destructive probe.
+        // Scope the probe to a tempdir so a broad cwd (e.g. $HOME) can't
+        // walk the user's whole tree and trip the glob caps.
+        let tmp = std::env::temp_dir();
+        let probe_input = serde_json::json!({
+            "pattern": "__claw-health-probe-nomatch__",
+            "path": tmp.to_string_lossy(),
+        })
+        .to_string();
+        match self.tool_executor.execute("glob_search", &probe_input) {
             Ok(_) => Ok(()),
             Err(e) => Err(format!("Tool executor probe failed: {e}")),
         }
@@ -346,6 +352,11 @@ where
                     "conversation loop exceeded the maximum number of iterations",
                 );
                 self.record_turn_failed(iterations, &error);
+                // Roll back the pending user message so the next call does not
+                // produce consecutive user messages on a clean retry.
+                if iterations == 1 {
+                    let _ = self.session.pop_last_message();
+                }
                 return Err(error);
             }
 
@@ -357,6 +368,9 @@ where
                 Ok(events) => events,
                 Err(error) => {
                     self.record_turn_failed(iterations, &error);
+                    if iterations == 1 {
+                        let _ = self.session.pop_last_message();
+                    }
                     return Err(error);
                 }
             };
@@ -365,6 +379,9 @@ where
                     Ok(result) => result,
                     Err(error) => {
                         self.record_turn_failed(iterations, &error);
+                        if iterations == 1 {
+                            let _ = self.session.pop_last_message();
+                        }
                         return Err(error);
                     }
                 };
@@ -572,6 +589,11 @@ where
         }
 
         self.session = result.compacted_session;
+        // Reset cumulative usage. The input_tokens on surviving messages
+        // reflect the pre-compaction prompt size — keeping them would pin the
+        // cumulative above the threshold and re-trigger compaction on every
+        // subsequent turn.
+        self.usage_tracker = UsageTracker::new();
         Some(AutoCompactionEvent {
             removed_message_count: result.removed_message_count,
         })
@@ -1504,16 +1526,21 @@ mod tests {
 
     #[test]
     fn auto_compacts_when_cumulative_input_threshold_is_crossed() {
-        struct SimpleApi;
+        #[derive(Default)]
+        struct SimpleApi {
+            calls: usize,
+        }
         impl ApiClient for SimpleApi {
             fn stream(
                 &mut self,
                 _request: ApiRequest,
             ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.calls += 1;
+                let input_tokens = if self.calls == 1 { 120_000 } else { 1_000 };
                 Ok(vec![
                     AssistantEvent::TextDelta("done".to_string()),
                     AssistantEvent::Usage(TokenUsage {
-                        input_tokens: 120_000,
+                        input_tokens,
                         output_tokens: 4,
                         cache_creation_input_tokens: 0,
                         cache_read_input_tokens: 0,
@@ -1535,10 +1562,12 @@ mod tests {
             }]),
         ];
 
+        let tool_executor =
+            StaticToolExecutor::new().register("glob_search", |_input| Ok(String::new()));
         let mut runtime = ConversationRuntime::new(
             session,
-            SimpleApi,
-            StaticToolExecutor::new(),
+            SimpleApi::default(),
+            tool_executor,
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
             vec!["system".to_string()],
         )
@@ -1555,6 +1584,47 @@ mod tests {
             })
         );
         assert_eq!(runtime.session().messages[0].role, MessageRole::System);
+
+        // Regression: after compaction, cumulative usage must be reset so
+        // the next turn does not auto-compact again purely because the old
+        // high-token count is still on the tracker.
+        let second = runtime
+            .run_turn("follow up", None)
+            .expect("second turn should succeed");
+        assert!(
+            second.auto_compaction.is_none(),
+            "second turn must not re-compact immediately after the first compaction"
+        );
+    }
+
+    #[test]
+    fn failed_first_iteration_rolls_back_user_message() {
+        struct FailingApi;
+        impl ApiClient for FailingApi {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                Err(RuntimeError::new("simulated API failure"))
+            }
+        }
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            FailingApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+
+        let initial_len = runtime.session().messages.len();
+        let _ = runtime.run_turn("first attempt", None);
+
+        assert_eq!(
+            runtime.session().messages.len(),
+            initial_len,
+            "failed first iteration must roll back the user message so session length is unchanged"
+        );
     }
 
     #[test]

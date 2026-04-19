@@ -416,21 +416,17 @@ pub fn glob_search(pattern: &str, path: Option<&str>) -> io::Result<GlobSearchOu
 
     let mut matches: Vec<(PathBuf, Option<std::time::SystemTime>)> = Vec::new();
     let mut visited: usize = 0;
+    let mut cap_truncated = false;
 
     for entry_result in builder.build() {
         if Instant::now() >= deadline {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                format!(
-                    "glob_search: wall-clock timeout ({GLOB_TIMEOUT_SECS}s) exceeded after {visited} entries"
-                ),
-            ));
+            cap_truncated = true;
+            break;
         }
         visited += 1;
         if visited > GLOB_MAX_VISITED {
-            return Err(io::Error::other(format!(
-                "glob_search: visited-entry cap ({GLOB_MAX_VISITED}) exceeded"
-            )));
+            cap_truncated = true;
+            break;
         }
 
         let Ok(entry) = entry_result else { continue };
@@ -452,7 +448,7 @@ pub fn glob_search(pattern: &str, path: Option<&str>) -> io::Result<GlobSearchOu
 
     matches.sort_by_key(|(_, mtime)| mtime.map(Reverse));
 
-    let truncated = matches.len() > GLOB_MAX_RESULTS;
+    let truncated = cap_truncated || matches.len() > GLOB_MAX_RESULTS;
     let filenames: Vec<String> = matches
         .into_iter()
         .take(GLOB_MAX_RESULTS)
@@ -526,10 +522,7 @@ pub fn grep_search(input: &GrepSearchInput) -> io::Result<GrepSearchOutput> {
 
     for file_path in collect_search_files(&base_path, deadline)? {
         if Instant::now() >= deadline {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                format!("grep_search: wall-clock timeout ({GREP_TIMEOUT_SECS}s) exceeded"),
-            ));
+            break;
         }
         if !matches_optional_filters(&file_path, glob_filter.as_ref(), file_type) {
             continue;
@@ -608,6 +601,7 @@ pub fn grep_search(input: &GrepSearchInput) -> io::Result<GrepSearchOutput> {
     })
 }
 
+#[allow(clippy::unnecessary_wraps)]
 fn collect_search_files(base_path: &Path, deadline: Instant) -> io::Result<Vec<PathBuf>> {
     if base_path.is_file() {
         return Ok(vec![base_path.to_path_buf()]);
@@ -642,16 +636,11 @@ fn collect_search_files(base_path: &Path, deadline: Instant) -> io::Result<Vec<P
     let mut visited: usize = 0;
     for entry_result in builder.build() {
         if Instant::now() >= deadline {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                format!("grep_search: wall-clock timeout ({GREP_TIMEOUT_SECS}s) exceeded while collecting files"),
-            ));
+            break;
         }
         visited += 1;
         if visited > GREP_MAX_VISITED {
-            return Err(io::Error::other(format!(
-                "grep_search: visited-entry cap ({GREP_MAX_VISITED}) exceeded"
-            )));
+            break;
         }
         let Ok(entry) = entry_result else { continue };
         if matches!(entry.file_type(), Some(ft) if ft.is_file()) {
@@ -1072,14 +1061,8 @@ mod glob_hardening_tests {
             "reproducer took {elapsed:?}, expected < {}s",
             GLOB_TIMEOUT_SECS + 3
         );
-        // Either found some files or bailed out cleanly.
-        match res {
-            Ok(o) => assert!(o.num_files <= GLOB_MAX_RESULTS),
-            Err(e) => assert!(matches!(
-                e.kind(),
-                io::ErrorKind::TimedOut | io::ErrorKind::Other
-            )),
-        }
+        let out = res.expect("glob_search should return partial, not error, on cap hit");
+        assert!(out.num_files <= GLOB_MAX_RESULTS);
     }
 
     #[test]
