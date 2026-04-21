@@ -82,10 +82,24 @@ impl Display for ToolError {
 
 impl std::error::Error for ToolError {}
 
+/// Classifies recoverable vs. fatal runtime failures for targeted recovery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorKind {
+    Generic,
+    /// Assistant stream finished with zero content blocks — typically caused by
+    /// `finish_reason=length` on Ollama/OpenAI-compat when the context window
+    /// is saturated. Recoverable via forced compaction + retry.
+    EmptyAssistantStream,
+    /// Assistant stream ended without a MessageStop event — recoverable like
+    /// EmptyAssistantStream (often the same root cause: mid-stream truncation).
+    NoMessageStop,
+}
+
 /// Error returned when a conversation turn cannot be completed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeError {
     message: String,
+    kind: ErrorKind,
 }
 
 impl RuntimeError {
@@ -93,7 +107,37 @@ impl RuntimeError {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            kind: ErrorKind::Generic,
         }
+    }
+
+    #[must_use]
+    pub fn empty_stream() -> Self {
+        Self {
+            message: "assistant stream produced no content".to_string(),
+            kind: ErrorKind::EmptyAssistantStream,
+        }
+    }
+
+    #[must_use]
+    pub fn no_message_stop() -> Self {
+        Self {
+            message: "assistant stream ended without a message stop event".to_string(),
+            kind: ErrorKind::NoMessageStop,
+        }
+    }
+
+    #[must_use]
+    pub fn kind(&self) -> ErrorKind {
+        self.kind
+    }
+
+    #[must_use]
+    pub fn is_recoverable(&self) -> bool {
+        matches!(
+            self.kind,
+            ErrorKind::EmptyAssistantStream | ErrorKind::NoMessageStop
+        )
     }
 }
 
@@ -324,16 +368,24 @@ where
     ) -> Result<TurnSummary, RuntimeError> {
         let user_input = user_input.into();
 
-        // ROADMAP #38: Session-health canary - probe if context was compacted
+        // ROADMAP #38: Session-health canary — soft-fail only. If the probe
+        // trips (e.g. filesystem cap, transient tool error) we no longer abort
+        // the whole session: the empty-stream recovery path below catches any
+        // actual runtime breakage via forced compaction + retry.
         if self.session.compaction.is_some() {
             if let Err(error) = self.run_session_health_probe() {
-                return Err(RuntimeError::new(format!(
-                    "Session health probe failed after compaction: {error}. \
-                     The session may be in an inconsistent state. \
-                     Consider starting a fresh session with /session new."
-                )));
+                eprintln!(
+                    "claw: session health probe warning after compaction: {error} \
+                     (continuing — empty-stream recovery will handle real breakage)"
+                );
             }
         }
+
+        // Recovery budget for empty-assistant-stream / missing-stop events.
+        // Each trip forces an aggressive compaction and retries the same turn
+        // without losing the user's input. Two attempts is enough to shed a
+        // bloated history once; beyond that the fault is structural.
+        let mut recovery_attempts_left: u32 = 2;
 
         self.record_turn_started(&user_input);
         self.session
@@ -367,6 +419,15 @@ where
             let events = match self.api_client.stream(request) {
                 Ok(events) => events,
                 Err(error) => {
+                    if error.is_recoverable() && recovery_attempts_left > 0 {
+                        recovery_attempts_left -= 1;
+                        eprintln!(
+                            "claw: recoverable stream error ({}); forcing compaction and retrying",
+                            error
+                        );
+                        let _ = self.forced_compact();
+                        continue;
+                    }
                     self.record_turn_failed(iterations, &error);
                     if iterations == 1 {
                         let _ = self.session.pop_last_message();
@@ -378,6 +439,15 @@ where
                 match build_assistant_message(events) {
                     Ok(result) => result,
                     Err(error) => {
+                        if error.is_recoverable() && recovery_attempts_left > 0 {
+                            recovery_attempts_left -= 1;
+                            eprintln!(
+                                "claw: {} — likely ctx saturation, forcing compaction and retrying",
+                                error
+                            );
+                            let _ = self.forced_compact();
+                            continue;
+                        }
                         self.record_turn_failed(iterations, &error);
                         if iterations == 1 {
                             let _ = self.session.pop_last_message();
@@ -567,6 +637,27 @@ where
     #[must_use]
     pub fn into_session(self) -> Session {
         self.session
+    }
+
+    /// Aggressively compact the session regardless of the configured token
+    /// threshold. Used by recovery when the upstream model emits an empty
+    /// stream (typically `finish_reason=length` under Ollama/OpenAI-compat).
+    fn forced_compact(&mut self) -> Option<AutoCompactionEvent> {
+        let result = compact_session(
+            &self.session,
+            CompactionConfig {
+                max_estimated_tokens: 0,
+                preserve_recent_messages: 2,
+            },
+        );
+        if result.removed_message_count == 0 {
+            return None;
+        }
+        self.session = result.compacted_session;
+        self.usage_tracker = UsageTracker::new();
+        Some(AutoCompactionEvent {
+            removed_message_count: result.removed_message_count,
+        })
     }
 
     fn maybe_auto_compact(&mut self) -> Option<AutoCompactionEvent> {
@@ -759,12 +850,10 @@ fn build_assistant_message(
     flush_text_block(&mut text, &mut blocks);
 
     if !finished {
-        return Err(RuntimeError::new(
-            "assistant stream ended without a message stop event",
-        ));
+        return Err(RuntimeError::no_message_stop());
     }
     if blocks.is_empty() {
-        return Err(RuntimeError::new("assistant stream produced no content"));
+        return Err(RuntimeError::empty_stream());
     }
 
     Ok((
@@ -845,8 +934,9 @@ impl ToolExecutor for StaticToolExecutor {
 mod tests {
     use super::{
         build_assistant_message, parse_auto_compaction_threshold, ApiClient, ApiRequest,
-        AssistantEvent, AutoCompactionEvent, ConversationRuntime, PromptCacheEvent, RuntimeError,
-        StaticToolExecutor, ToolExecutor, DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
+        AssistantEvent, AutoCompactionEvent, ConversationRuntime, ErrorKind, PromptCacheEvent,
+        RuntimeError, StaticToolExecutor, ToolExecutor,
+        DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
     };
     use crate::compact::CompactionConfig;
     use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
@@ -855,7 +945,7 @@ mod tests {
         PermissionRequest,
     };
     use crate::prompt::{ProjectContext, SystemPromptBuilder};
-    use crate::session::{ContentBlock, MessageRole, Session};
+    use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
     use crate::usage::TokenUsage;
     use crate::ToolError;
     use std::fs;
@@ -1682,14 +1772,21 @@ mod tests {
     }
 
     #[test]
-    fn compaction_health_probe_blocks_turn_when_tool_executor_is_broken() {
+    fn compaction_health_probe_soft_fails_and_continues_turn() {
+        // Probe failure used to abort the whole turn, which in practice killed
+        // sessions for benign transient tool errors. Empty-stream recovery now
+        // handles real breakage, so a probe failure should degrade to a warning
+        // and let the turn proceed to the API call.
         struct SimpleApi;
         impl ApiClient for SimpleApi {
             fn stream(
                 &mut self,
                 _request: ApiRequest,
             ) -> Result<Vec<AssistantEvent>, RuntimeError> {
-                panic!("API should not run when health probe fails");
+                Ok(vec![
+                    AssistantEvent::TextDelta("done".to_string()),
+                    AssistantEvent::MessageStop,
+                ])
             }
         }
 
@@ -1710,19 +1807,10 @@ mod tests {
             vec!["system".to_string()],
         );
 
-        let error = runtime
+        let summary = runtime
             .run_turn("trigger", None)
-            .expect_err("health probe failure should abort the turn");
-        assert!(
-            error
-                .to_string()
-                .contains("Session health probe failed after compaction"),
-            "unexpected error: {error}"
-        );
-        assert!(
-            error.to_string().contains("transport unavailable"),
-            "expected underlying probe error: {error}"
-        );
+            .expect("probe failure must not abort the turn");
+        assert_eq!(summary.iterations, 1);
     }
 
     #[test]
@@ -1791,6 +1879,69 @@ mod tests {
         assert!(error
             .to_string()
             .contains("assistant stream produced no content"));
+        assert_eq!(error.kind(), ErrorKind::EmptyAssistantStream);
+        assert!(error.is_recoverable());
+    }
+
+    #[test]
+    fn empty_stream_triggers_forced_compaction_and_recovers() {
+        // Simulate the crash class from diary 2026-04-19: first API call returns
+        // a MessageStop with zero content blocks (finish_reason=length on
+        // Ollama). Expectation: runtime forces compaction and retries within
+        // the same turn instead of aborting the session.
+        struct FlakyApi {
+            calls: usize,
+        }
+        impl ApiClient for FlakyApi {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.calls += 1;
+                if self.calls == 1 {
+                    Ok(vec![AssistantEvent::MessageStop])
+                } else {
+                    Ok(vec![
+                        AssistantEvent::TextDelta("recovered".to_string()),
+                        AssistantEvent::MessageStop,
+                    ])
+                }
+            }
+        }
+
+        let mut session = Session::new();
+        // Populate enough prior turns to make forced_compact actually remove
+        // something (needs preserve_recent_messages + 1 compactable messages).
+        for i in 0..6 {
+            session
+                .push_user_text(format!("older turn {i}"))
+                .expect("seed user message");
+            session
+                .push_message(ConversationMessage::assistant_with_usage(
+                    vec![ContentBlock::Text {
+                        text: format!("older reply {i}"),
+                    }],
+                    None,
+                ))
+                .expect("seed assistant message");
+        }
+
+        let mut runtime = ConversationRuntime::new(
+            session,
+            FlakyApi { calls: 0 },
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+
+        let summary = runtime
+            .run_turn("please recover", None)
+            .expect("empty-stream crash should be recovered, not fatal");
+        assert!(summary
+            .assistant_messages
+            .iter()
+            .flat_map(|m| m.blocks.iter())
+            .any(|b| matches!(b, ContentBlock::Text { text } if text.contains("recovered"))));
     }
 
     #[test]

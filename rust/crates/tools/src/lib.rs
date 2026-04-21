@@ -8969,7 +8969,9 @@ mod tests {
         let write_update_output: serde_json::Value =
             serde_json::from_str(&write_update).expect("json");
         assert_eq!(write_update_output["type"], "update");
-        assert_eq!(write_update_output["originalFile"], "alpha\nbeta\nalpha\n");
+        // originalFile intentionally omitted from the tool_result to keep
+        // write_file from blowing up the ctx window (see commit ce034d0).
+        assert!(write_update_output["originalFile"].is_null());
 
         let read_full = execute_tool("read_file", &json!({ "path": "nested/demo.txt" }))
             .expect("read full should succeed");
