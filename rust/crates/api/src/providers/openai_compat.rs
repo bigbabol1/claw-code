@@ -1206,7 +1206,67 @@ fn normalize_response(
 }
 
 fn parse_tool_arguments(arguments: &str) -> Value {
-    serde_json::from_str(arguments).unwrap_or_else(|_| json!({ "raw": arguments }))
+    if let Ok(value) = serde_json::from_str::<Value>(arguments) {
+        return value;
+    }
+    if let Some(repaired) = repair_tool_json(arguments) {
+        if let Ok(value) = serde_json::from_str::<Value>(&repaired) {
+            return value;
+        }
+    }
+    json!({ "raw": arguments })
+}
+
+/// Best-effort repair for malformed tool-call JSON emitted by some local
+/// models (Qwen/Ollama occasionally wrap JSON in code fences, prepend BOM,
+/// or drop the closing brace under token pressure).
+fn repair_tool_json(raw: &str) -> Option<String> {
+    let trimmed = raw.trim_start_matches('\u{feff}').trim();
+
+    let body = if let Some(rest) = trimmed.strip_prefix("```") {
+        let rest = rest.strip_prefix("json").unwrap_or(rest);
+        let rest = rest.trim_start_matches('\n');
+        rest.strip_suffix("```").unwrap_or(rest).trim()
+    } else {
+        trimmed
+    };
+
+    let body = match (body.find('{'), body.rfind('}')) {
+        (Some(start), Some(end)) if end > start => &body[start..=end],
+        (Some(start), None) => &body[start..],
+        _ => body,
+    };
+
+    let mut depth: i32 = 0;
+    let mut in_string = false;
+    let mut escaped = false;
+    for ch in body.chars() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '{' => depth += 1,
+            '}' => depth -= 1,
+            _ => {}
+        }
+    }
+    if depth <= 0 {
+        return Some(body.to_string());
+    }
+
+    let mut patched = body.to_string();
+    for _ in 0..depth {
+        patched.push('}');
+    }
+    Some(patched)
 }
 
 fn next_sse_frame(buffer: &mut Vec<u8>) -> Option<String> {
@@ -1559,6 +1619,30 @@ mod tests {
             json!({"city": "Paris"})
         );
         assert_eq!(parse_tool_arguments("not-json"), json!({"raw": "not-json"}));
+    }
+
+    #[test]
+    fn parses_tool_arguments_repairs_code_fence() {
+        assert_eq!(
+            parse_tool_arguments("```json\n{\"city\":\"Paris\"}\n```"),
+            json!({"city": "Paris"})
+        );
+    }
+
+    #[test]
+    fn parses_tool_arguments_repairs_missing_closing_brace() {
+        assert_eq!(
+            parse_tool_arguments("{\"city\":\"Paris\""),
+            json!({"city": "Paris"})
+        );
+    }
+
+    #[test]
+    fn parses_tool_arguments_repairs_leading_bom_and_prose() {
+        assert_eq!(
+            parse_tool_arguments("\u{feff}Here you go: {\"city\":\"Paris\"}"),
+            json!({"city": "Paris"})
+        );
     }
 
     #[test]
