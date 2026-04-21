@@ -1,0 +1,36 @@
+# Canonical Modelfile for the `claw-code:latest` Ollama model.
+#
+# Build:  ollama create claw-code:latest -f ollama/Modelfile.claw-code
+# Verify: ollama show claw-code:latest | grep num_ctx
+#
+# Base: Qwen3.5-27.8B Q4_K_M (architecturally supports 262 144 ctx).
+# Running on RTX 3090 (24 GB) with OLLAMA_KV_CACHE_TYPE=int8:
+#     weights ~17 GB
+#     KV @ 65 536 ctx int8 ~ 4.5 GB
+#     overhead ~ 0.5 GB
+#     total ~ 22 GB  (fits in 24 GB with Qwen idle elsewhere)
+#
+# Never set `PARAMETER thinking false`: conflicts with Qwen3.5's native
+# think-token stream and causes mid-stream runner restarts (see diary
+# 2026-04-19 crash.debug.round2).
+# FROM references the base blob already present locally. On a fresh host,
+# first `ollama pull` the Qwen3.5 GGUF of your choice and replace this line.
+FROM claw-code:latest
+TEMPLATE {{ .Prompt }}
+RENDERER qwen3.5
+PARSER qwen3.5
+
+# Context window: 32 768 is the current VRAM ceiling on RTX 3090.
+# Attempted 40 960 / 49 152 / 65 536 on 2026-04-21 — all returned
+# "memory layout cannot be allocated with num_gpu = 99" from the CUDA
+# backend even with OLLAMA_KV_CACHE_TYPE=q8_0 and FLASH_ATTENTION=1.
+# The Wave 1 forced-compaction recovery handles saturation gracefully, so
+# bumping ctx is no longer urgent. Re-evaluate on GPU upgrade.
+PARAMETER num_ctx 32768
+
+PARAMETER num_gpu 99
+PARAMETER num_thread 6
+PARAMETER temperature 0.3
+PARAMETER top_p 0.9
+PARAMETER top_k 40
+PARAMETER presence_penalty 1.1
