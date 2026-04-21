@@ -3992,6 +3992,7 @@ impl LiveCli {
                 Ok(())
             }
             Err(error) => {
+                write_crash_dump(&runtime, input, &error);
                 runtime.shutdown_plugins()?;
                 spinner.fail(
                     "❌ Request failed",
@@ -6358,6 +6359,52 @@ fn render_session_markdown(session: &Session, session_id: &str, session_path: &P
         }
     }
     lines.join("\n")
+}
+
+fn write_crash_dump(runtime: &BuiltRuntime, input: &str, error: &RuntimeError) {
+    let session = runtime.session();
+    let recent_tools: Vec<String> = session
+        .messages
+        .iter()
+        .rev()
+        .flat_map(|m| m.blocks.iter().rev())
+        .filter_map(|b| match b {
+            ContentBlock::ToolUse { name, .. } => Some(name.clone()),
+            _ => None,
+        })
+        .take(3)
+        .collect();
+    let compaction = session.compaction.as_ref().map(|c| {
+        json!({
+            "count": c.count,
+            "removed_message_count": c.removed_message_count,
+        })
+    });
+    let ts = std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let dump = json!({
+        "timestamp": ts,
+        "session_id": session.session_id,
+        "error_kind": format!("{:?}", error.kind()),
+        "error_message": error.to_string(),
+        "input": input,
+        "recent_tools": recent_tools,
+        "message_count": session.messages.len(),
+        "estimated_tokens": runtime.estimated_tokens(),
+        "compaction": compaction,
+    });
+    let Ok(home) = env::var("HOME") else {
+        return;
+    };
+    let dir = PathBuf::from(home).join(".local/share/claw/crashes");
+    let _ = fs::create_dir_all(&dir);
+    let path = dir.join(format!("{ts}-{}.json", session.session_id));
+    if let Ok(body) = serde_json::to_string_pretty(&dump) {
+        let _ = fs::write(&path, body);
+        eprintln!("claw: crash dump written to {}", path.display());
+    }
 }
 
 fn short_tool_id(id: &str) -> String {

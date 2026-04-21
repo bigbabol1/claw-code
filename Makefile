@@ -10,7 +10,7 @@ BIN := $(RUST_DIR)/target/release/claw
 SYMLINK := $(HOME)/.local/bin/claw
 MODELFILE := ollama/Modelfile.claw-code
 
-.PHONY: all build test release install model doctor clean push smoke
+.PHONY: all build test release install model doctor clean push smoke smoke3
 
 all: release
 
@@ -41,6 +41,9 @@ smoke: install model
 
 doctor:
 	@./scripts/doctor.sh 2>/dev/null || echo "doctor script not yet installed"
+
+smoke3:
+	@./scripts/smoke_3turn.sh
 
 push:
 	git push origin main
