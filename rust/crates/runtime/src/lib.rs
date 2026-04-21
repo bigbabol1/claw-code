@@ -12,6 +12,7 @@ mod compact;
 mod config;
 pub mod config_validate;
 mod conversation;
+pub mod ctx_budget;
 mod file_ops;
 mod git_context;
 pub mod green_contract;

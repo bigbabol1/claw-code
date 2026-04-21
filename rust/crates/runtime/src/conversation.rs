@@ -180,6 +180,7 @@ pub struct ConversationRuntime<C, T> {
     hook_abort_signal: HookAbortSignal,
     hook_progress_reporter: Option<Box<dyn HookProgressReporter>>,
     session_tracer: Option<SessionTracer>,
+    ctx_budget: crate::ctx_budget::CtxBudget,
 }
 
 impl<C, T> ConversationRuntime<C, T>
@@ -229,7 +230,14 @@ where
             hook_abort_signal: HookAbortSignal::default(),
             hook_progress_reporter: None,
             session_tracer: None,
+            ctx_budget: crate::ctx_budget::CtxBudget::default(),
         }
+    }
+
+    #[must_use]
+    pub fn with_ctx_budget(mut self, ctx_budget: crate::ctx_budget::CtxBudget) -> Self {
+        self.ctx_budget = ctx_budget;
+        self
     }
 
     #[must_use]
@@ -412,6 +420,23 @@ where
                 return Err(error);
             }
 
+            // Pre-send CtxBudget check: compact before Ollama saturates its
+            // KV cache. Without this, a large history silently hits
+            // finish_reason=length and we only recover post-crash via
+            // `is_recoverable` below. Running the check per-iteration (not
+            // only per-turn) catches tool-output growth mid-loop.
+            let current_tokens = estimate_session_tokens(&self.session);
+            if matches!(
+                self.ctx_budget.check(current_tokens),
+                crate::ctx_budget::BudgetVerdict::Soft | crate::ctx_budget::BudgetVerdict::Hard
+            ) {
+                eprintln!(
+                    "claw: ctx budget soft/hard threshold reached at ~{} tokens; pre-send compaction",
+                    current_tokens
+                );
+                let _ = self.forced_compact();
+            }
+
             let request = ApiRequest {
                 system_prompt: self.system_prompt.clone(),
                 messages: self.session.messages.clone(),
@@ -539,6 +564,18 @@ where
                                 Ok(output) => (output, false),
                                 Err(error) => (error.to_string(), true),
                             };
+                        // Fit tool output into the remaining ctx budget. A
+                        // `bash cat` on a megabyte file would otherwise blow
+                        // the KV cache mid-loop; we preserve head + tail and
+                        // insert an explicit marker so the model can reason
+                        // about the elision.
+                        let current_after_assistant = estimate_session_tokens(&self.session);
+                        if let std::borrow::Cow::Owned(fitted) = self
+                            .ctx_budget
+                            .fit_tool_output(&output, current_after_assistant)
+                        {
+                            output = fitted;
+                        }
                         output = merge_hook_feedback(pre_hook_result.messages(), output, false);
 
                         let post_hook_result = if is_error {
